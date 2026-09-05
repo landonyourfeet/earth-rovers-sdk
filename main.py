@@ -1061,45 +1061,63 @@ async def audio_feed():
     )
 
 
-# ★ OKCREAL (Sep 5, 2026 — Cap: "we have built a dock. need self docking
-#   capability now"). The dock is a mat with MAGENTA chevron rails down both
-#   edges and a charging stand at its head carrying a crosshair target with a
-#   magenta bullseye. Measured on Cap's own console shots: the rails are the
-#   reliable far/mid-range cue (the bullseye is a few pale pixels beyond ~1 m
-#   and washes out), and the bullseye becomes a big round blob only at the
-#   stand. So the controller LANE-FOLLOWS the rails — centers the rover
-#   between the two rail clusters (or offsets from a lone rail) and creeps up
-#   the mat — and calls DOCKED when either the bullseye fills DOCK_DOT_DONE of
-#   the frame width or the wheels stall against the stand (forward commanded,
-#   rpms ~0). Lost mat → stop, slow search turn, give up after DOCK_SEARCH_S.
-#   Any manual motion on /control aborts. Creep speeds sit under the wall-flip
-#   threshold. Every tunable is an env var.
-import cv2  # noqa: E402  (dependency via video_feed)
+# ★ OKCREAL (Sep 5, 2026 — Cap: "use the front camera to find the dock, then
+#   when close bust a 180, then switch to rear camera and dock"). Two-stage
+#   self-dock, v2. The dock stand carries a full-sheet deep-magenta flyer with
+#   an ArUco 4x4_50 tag (ID 7). Measured on Cap's console shots today:
+#     • the magenta sheet is the far cue (a few px across the room);
+#     • the tag decodes from ~2.5 m in at feed resolution;
+#     • the REAR camera stream is horizontally MIRRORED (backup-cam style) —
+#       the tag only decodes after flipping; the geometry uses the raw frame
+#       since raw image-right is the rover's right. Mirroring is auto-detected
+#       per camera by which orientation decodes, so a firmware change can't
+#       silently break it.
+#   Phases: FIND/APPROACH on the front cam driving forward until the tag is
+#   DOCK_TAG_TURN_PX wide (~1 m) → TURN 180° on the compass heading (sign
+#   learned from the first second of rotation) → BACK on the rear cam:
+#   center the tag/sheet (steering sign learned adaptively — if the error
+#   grows four steps running, the sign flips), reverse at creep, hold the
+#   mat rails for the last stretch → DOCKED when the wheels stall against the
+#   stand. Lost marker → stop, slow search turn, give up. Manual drive or
+#   ALL STOP aborts. Every tunable is a DOCK_* env var.
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
 DOCK = {
-    "hue_lo": int(os.getenv("DOCK_HUE_LO", "135")),      # OpenCV hue 0–180: mat rails + bullseye ≈ 145–160
-    "hue_hi": int(os.getenv("DOCK_HUE_HI", "180")),
-    "sat_min": int(os.getenv("DOCK_SAT_MIN", "60")),
-    "val_min": int(os.getenv("DOCK_VAL_MIN", "60")),
+    "tag_id": int(os.getenv("DOCK_TAG_ID", "7")),
+    # mat rails (red-magenta chevrons): hue 146–158 on camera
+    "hue_lo": int(os.getenv("DOCK_HUE_LO", "135")), "hue_hi": int(os.getenv("DOCK_HUE_HI", "180")),
+    "sat_min": int(os.getenv("DOCK_SAT_MIN", "60")), "val_min": int(os.getenv("DOCK_VAL_MIN", "60")),
+    # flyer sheet (deep magenta print reads lavender on camera): hue 126–142, bright
+    "sheet_hue_lo": int(os.getenv("DOCK_SHEET_HUE_LO", "126")), "sheet_hue_hi": int(os.getenv("DOCK_SHEET_HUE_HI", "142")),
+    "sheet_sat_min": int(os.getenv("DOCK_SHEET_SAT_MIN", "60")), "sheet_val_min": int(os.getenv("DOCK_SHEET_VAL_MIN", "120")),
     "min_ratio": float(os.getenv("DOCK_MIN_RATIO", "0.008")),
-    "lane_half": float(os.getenv("DOCK_LANE_HALF", "0.33")),      # lone rail → lane center offset (fraction of width)
-    "dot_done_ratio": float(os.getenv("DOCK_DOT_DONE", "0.07")),  # bullseye width / frame width = at the stand
-    "creep": float(os.getenv("DOCK_CREEP", "0.12")),
-    "creep_near": float(os.getenv("DOCK_CREEP_NEAR", "0.08")),
-    "near_area": float(os.getenv("DOCK_NEAR_AREA", "0.010")),    # rail pixel area fraction → close to the stand
-    "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")),
-    "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.30")),
-    "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")),
-    "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
-    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.22")),
-    "search_s": float(os.getenv("DOCK_SEARCH_S", "20")),
-    "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "150")),
-    "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
+    "lane_half": float(os.getenv("DOCK_LANE_HALF", "0.33")),
+    "sheet_floor_y": float(os.getenv("DOCK_SHEET_FLOOR_Y", "0.70")),   # small blobs below this line are floor clutter, not the sheet
+    "fwd": float(os.getenv("DOCK_FWD", "0.16")), "fwd_near": float(os.getenv("DOCK_FWD_NEAR", "0.10")),
+    "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
+    "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "150")),   # tag side px @640 wide when it's time to turn (~1 m)
+    "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
+    "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.30")),
+    "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")), "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
+    "spin": float(os.getenv("DOCK_SPIN", "0.45")),               # 180° turn rate
+    "spin_tol_deg": float(os.getenv("DOCK_SPIN_TOL_DEG", "8")), "spin_timeout_s": float(os.getenv("DOCK_SPIN_TIMEOUT_S", "25")),
+    "spin_blind_s": float(os.getenv("DOCK_SPIN_BLIND_S", "3.5")),   # no heading data: timed turn
+    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.22")), "search_s": float(os.getenv("DOCK_SEARCH_S", "25")),
+    "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
+    "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
+    "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "1")),      # rear cam (raw/mirrored frame), reversing
 }
-_dock = {"task": None, "state": "idle", "phase": None, "since": None, "reason": None,
-         "sense": None, "started_at": None, "last_seen": None, "cmds": 0}
+_dock = {"task": None, "state": "idle", "phase": None, "since": None, "reason": None, "sense": None,
+         "started_at": None, "last_seen": None, "cmds": 0, "cam": None,
+         "mirror": {"front": None, "rear": None}, "sign": {"front": DOCK["front_sign"], "rear": DOCK["rear_sign"], "spin": 1.0}}
+
+_aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+_aruco_params = cv2.aruco.DetectorParameters()
+_aruco_params.adaptiveThreshWinSizeMin = 3; _aruco_params.adaptiveThreshWinSizeMax = 35; _aruco_params.adaptiveThreshWinSizeStep = 4
+_aruco_params.minMarkerPerimeterRate = 0.01
+_aruco = cv2.aruco.ArucoDetector(_aruco_dict, _aruco_params)
 
 
 def dock_sense(jpeg):
@@ -1149,6 +1167,77 @@ def dock_sense(jpeg):
     return out
 
 
+
+def _dock_find_tag(gray, w):
+    corners, ids, _ = _aruco.detectMarkers(gray)
+    if ids is None:
+        return None
+    for c, i in zip(corners, ids.ravel()):
+        if int(i) == DOCK["tag_id"]:
+            q = c[0]
+            side = float(max(np.linalg.norm(q[0] - q[1]), np.linalg.norm(q[1] - q[2])))
+            return {"cx": float(q[:, 0].mean()) / w, "cy": float(q[:, 1].mean()) / gray.shape[0], "side_px": round(side * (640.0 / w), 1)}
+    return None
+
+
+def dock_see(jpeg: bytes, cam: str):
+    """Everything the docker can see in one frame: tag (with mirror auto-detect),
+    magenta sheet, mat rails. x_err values are in RAW frame coordinates."""
+    img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    out = {"cam": cam, "tag": None, "sheet": None, "rails": None, "lane_err": None}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mir = _dock["mirror"].get(cam)
+    order = [False, True] if mir is None else [bool(mir), not bool(mir)]
+    for flipped in order:
+        t = _dock_find_tag(cv2.flip(gray, 1) if flipped else gray, w)
+        if t:
+            if flipped:
+                t["cx"] = 1.0 - t["cx"]
+            t["x_err"] = round(t["cx"] - 0.5, 3); t["mirrored"] = flipped
+            if _dock["mirror"].get(cam) is None:
+                _dock["mirror"][cam] = flipped; logger.info("dock: %s camera is %s", cam, "MIRRORED" if flipped else "not mirrored")
+            out["tag"] = t
+            break
+    # magenta sheet: purple-magenta blobs above the floor line
+    # (tuned on Cap's Sep 5 shots: the printed sheet reads hue 127–137 and bright;
+    #  dark purple shadows, the red-X floor sheet (hue ~165) and the rug are rejected
+    #  by hue band, brightness, aspect, and the floor line)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (DOCK["sheet_hue_lo"], DOCK["sheet_sat_min"], DOCK["sheet_val_min"]), (DOCK["sheet_hue_hi"], 255, 255))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    cs, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    for c in cs:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bw < 4 or bh < 4:
+            continue
+        asp = bw / float(bh)
+        if asp < 0.4 or asp > 2.5:
+            continue
+        cy = (y + bh / 2.0) / h
+        if cy > DOCK["sheet_floor_y"] and bw / float(w) < 0.3:
+            continue
+        roi = hsv[y:y + bh, x:x + bw]
+        if (roi[..., 2] >= DOCK["sheet_val_min"]).mean() < 0.5 or np.median(roi[..., 1]) < DOCK["sheet_sat_min"]:
+            continue
+        if best is None or bw * bh > best[2] * best[3]:
+            best = (x, y, bw, bh)
+    if best:
+        x, y, bw, bh = best
+        out["sheet"] = {"x_err": round((x + bw / 2.0) / w - 0.5, 3), "ratio": round(bw / float(w), 4), "cy": round((y + bh / 2.0) / h, 3)}
+    # mat rails (for the last stretch)
+    try:
+        r = dock_sense(jpeg)
+        if r and r.get("rails"):
+            out["rails"] = r["rails"]; out["lane_err"] = r["lane_err"]
+    except Exception:
+        pass
+    return out
+
+
 def _dock_rpms_zero() -> bool:
     d = telemetry_hub.latest or {}
     rp = d.get("rpms") or []
@@ -1159,6 +1248,15 @@ def _dock_rpms_zero() -> bool:
         return all(abs(float(v)) < 1.0 for v in last[:4])
     except Exception:
         return False
+
+
+def _dock_heading():
+    d = telemetry_hub.latest or {}
+    try:
+        o = d.get("orientation")
+        return None if o is None else float(o) % 360.0
+    except Exception:
+        return None
 
 
 async def _dock_send(linear: float, angular: float):
@@ -1173,69 +1271,170 @@ async def _dock_send(linear: float, angular: float):
 
 def _dock_set(phase, reason=None):
     if _dock["phase"] != phase:
-        _dock["phase"] = phase
-        _dock["since"] = time.time()
+        _dock["phase"] = phase; _dock["since"] = time.time()
         logger.info("dock: %s%s", phase, (" — " + reason) if reason else "")
     if reason:
         _dock["reason"] = reason
 
 
-async def _dock_loop():
-    period = 1.0 / max(1.0, DOCK["hz"])
-    broadcaster = feed_broadcasters["front"]
-    _dock["state"] = "docking"; _dock["started_at"] = time.time(); _dock["last_seen"] = None
-    _dock["sense"] = None; _dock["reason"] = None; _dock["cmds"] = 0
-    _dock_set("acquire")
-    forward_since = None
-    search_dir = 1.0
+async def _dock_frame(cam: str):
+    b = feed_broadcasters[cam]
     try:
-        while True:
-            now = time.time()
-            if now - _dock["started_at"] > DOCK["timeout_s"]:
-                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("timeout", "gave up after %ds" % DOCK["timeout_s"]); return
-            frame = None
-            try:
-                frame = await broadcaster.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
-            except Exception as e:
-                logger.warning("dock: frame error: %s", e)
-            sense = dock_sense(frame.jpeg) if frame else None
-            _dock["sense"] = sense
-            dot = (sense or {}).get("dot") if sense else None
-            lane_err = (sense or {}).get("lane_err") if sense else None
-            if dot and dot.get("big"):
-                await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "bullseye at the stand"); return
-            if lane_err is None:
-                if _dock["last_seen"] is None:
-                    _dock["last_seen"] = now
-                lost_for = now - _dock["last_seen"]
-                if lost_for < 1.5:
-                    await _dock_send(0, 0); _dock_set("lost", "mat out of view")
-                elif lost_for < 1.5 + DOCK["search_s"]:
-                    _dock_set("search", "turning to find the mat")
-                    await _dock_send(0, DOCK["search_turn"] * search_dir)
-                else:
-                    await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return
-                forward_since = None
-                await asyncio.sleep(period)
-                continue
-            _dock["last_seen"] = now
-            search_dir = -1.0 if lane_err > 0 else 1.0
-            rails = sense.get("rails") or {}
-            angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], -lane_err * DOCK["turn_gain"]))
-            if abs(lane_err) > DOCK["turn_only"]:
-                linear = 0.0; _dock_set("align", "centering on the mat")
-                forward_since = None
+        return await b.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
+    except Exception as e:
+        logger.warning("dock: %s frame error: %s", cam, e)
+        return None
+
+
+class _SignLearner:
+    """Flip the steering sign if the error keeps growing under correction."""
+    def __init__(self, cam):
+        self.cam = cam; self.prev = None; self.bad = 0
+    def sign(self):
+        return _dock["sign"][self.cam]
+    def observe(self, err, steered):
+        if self.prev is not None and steered:
+            if abs(err) > abs(self.prev) + 0.01:
+                self.bad += 1
             else:
-                if abs(lane_err) < DOCK["center_tol"]:
-                    angular = 0.0
-                near = (rails.get("area") or 0) >= DOCK["near_area"]
-                linear = DOCK["creep_near"] if near else DOCK["creep"]
-                _dock_set("approach", "creeping up the mat" + (" (near)" if near else ""))
-                forward_since = forward_since or now
-                if now - forward_since > DOCK["stall_s"] and _dock_rpms_zero():
-                    await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "wheels stalled against the stand"); return
-            await _dock_send(linear, angular)
-            await asyncio.sleep(period)
+                self.bad = 0
+            if self.bad >= 4:
+                _dock["sign"][self.cam] *= -1; self.bad = 0
+                logger.warning("dock: %s steering sign flipped to %+d (error kept growing)", self.cam, int(_dock["sign"][self.cam]))
+        self.prev = err
+
+
+async def _dock_stage_approach():
+    """Front cam, forward. Returns True when it's time to turn."""
+    learner = _SignLearner("front"); search_dir = 1.0
+    while True:
+        now = time.time()
+        if now - _dock["started_at"] > DOCK["timeout_s"]:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("timeout", "gave up after %ds" % DOCK["timeout_s"]); return False
+        fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None
+        _dock["sense"] = see; _dock["cam"] = "front"
+        tag = see and see.get("tag"); sheet = see and see.get("sheet")
+        tgt = tag or sheet
+        if not tgt:
+            if _dock["last_seen"] is None:
+                _dock["last_seen"] = now
+            lost = now - _dock["last_seen"]
+            if lost < 1.5:
+                await _dock_send(0, 0); _dock_set("lost", "dock not in view (front)")
+            elif lost < 1.5 + DOCK["search_s"]:
+                _dock_set("search", "turning to find the dock"); await _dock_send(0, DOCK["search_turn"] * search_dir)
+            else:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return False
+            await asyncio.sleep(1.0 / DOCK["hz"]); continue
+        _dock["last_seen"] = now
+        x_err = tgt["x_err"]; search_dir = 1.0 if x_err < 0 else -1.0
+        if tag and tag["side_px"] >= DOCK["tag_turn_px"] and abs(x_err) < DOCK["center_tol"] * 2:
+            await _dock_send(0, 0); return True
+        angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
+        if abs(x_err) > DOCK["turn_only"]:
+            linear = 0.0; _dock_set("align", "centering the dock (front)")
+        else:
+            if abs(x_err) < DOCK["center_tol"]:
+                angular = 0.0
+            linear = DOCK["fwd_near"] if (tag and tag["side_px"] >= DOCK["tag_near_px"]) else DOCK["fwd"]
+            _dock_set("approach", "driving to the dock" + (" · tag %dpx" % tag["side_px"] if tag else " · sheet"))
+        learner.observe(x_err, angular != 0.0)
+        await _dock_send(linear, angular)
+        await asyncio.sleep(1.0 / DOCK["hz"])
+
+
+async def _dock_stage_turn():
+    """180° about-face on the compass. Learns which way the heading moves."""
+    h0 = _dock_heading()
+    t0 = time.time()
+    if h0 is None:
+        _dock_set("turn", "no heading data — timed 180")
+        await _dock_send(0, DOCK["spin"] * _dock["sign"]["spin"])
+        await asyncio.sleep(DOCK["spin_blind_s"]); await _dock_send(0, 0); return True
+    target = (h0 + 180.0) % 360.0
+    def delta():
+        h = _dock_heading()
+        return None if h is None else ((h - target + 540.0) % 360.0) - 180.0
+    d_prev = delta(); sign = _dock["sign"]["spin"]; checked = False
+    _dock_set("turn", "180° turn: %d° → %d°" % (h0, target))
+    while True:
+        if time.time() - t0 > DOCK["spin_timeout_s"]:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_timeout", "180° turn did not complete"); return False
+        d = delta()
+        if d is not None and abs(d) <= DOCK["spin_tol_deg"]:
+            await _dock_send(0, 0); return True
+        if not checked and time.time() - t0 > 1.0 and d is not None and d_prev is not None:
+            checked = True
+            if abs(d) > abs(d_prev) + 2:   # heading moved the wrong way — flip and remember
+                sign *= -1; _dock["sign"]["spin"] = sign; logger.warning("dock: spin sign flipped to %+d", int(sign))
+        # shortest way round once we know the sign: steer toward reducing |d|
+        await _dock_send(0, DOCK["spin"] * sign)
+        await asyncio.sleep(0.2)
+
+
+async def _dock_stage_back():
+    """Rear cam (mirrored), reversing onto the mat until the wheels stall."""
+    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None
+    while True:
+        now = time.time()
+        if now - _dock["started_at"] > DOCK["timeout_s"]:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("timeout", "gave up after %ds" % DOCK["timeout_s"]); return False
+        fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None
+        _dock["sense"] = see; _dock["cam"] = "rear"
+        tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
+        # steering reference, best first: tag → sheet → rails
+        if tag:
+            x_err = tag["x_err"]; ref = "tag %dpx" % tag["side_px"]
+        elif sheet and sheet["ratio"] >= DOCK["min_ratio"]:
+            x_err = sheet["x_err"]; ref = "sheet %d%%" % int(sheet["ratio"] * 100)
+        elif lane is not None:
+            x_err = lane; ref = "rails"
+        else:
+            x_err = None; ref = None
+        if x_err is None:
+            if _dock["last_seen"] is None:
+                _dock["last_seen"] = now
+            lost = now - _dock["last_seen"]
+            if lost < 1.5:
+                await _dock_send(0, 0); _dock_set("lost", "dock not in view (rear)")
+            elif lost < 1.5 + DOCK["search_s"]:
+                _dock_set("search", "turning to find the dock (rear)"); await _dock_send(0, DOCK["search_turn"] * search_dir)
+            else:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "lost the dock while backing in"); return False
+            rev_since = None
+            await asyncio.sleep(1.0 / DOCK["hz"]); continue
+        _dock["last_seen"] = now
+        search_dir = 1.0 if x_err < 0 else -1.0
+        near = bool(tag and tag["side_px"] >= DOCK["tag_near_px"]) or bool(sheet and sheet["ratio"] >= 0.45)
+        angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
+        if abs(x_err) > DOCK["turn_only"] and not near:
+            linear = 0.0; _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
+        else:
+            if abs(x_err) < DOCK["center_tol"]:
+                angular = 0.0
+            linear = -(DOCK["rev_near"] if near else DOCK["rev"])
+            _dock_set("back", "backing onto the mat · " + ref)
+            rev_since = rev_since or now
+            if now - rev_since > DOCK["stall_s"] and _dock_rpms_zero():
+                await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "wheels stalled against the stand"); return True
+        learner.observe(x_err, angular != 0.0)
+        await _dock_send(linear, angular)
+        await asyncio.sleep(1.0 / DOCK["hz"])
+
+
+async def _dock_loop():
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None})
+    _dock_set("acquire")
+    try:
+        if not await browser_service.has_rear_camera():
+            _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
+        if not await _dock_stage_approach():
+            return
+        _dock["last_seen"] = None
+        if not await _dock_stage_turn():
+            return
+        _dock["last_seen"] = None
+        await _dock_stage_back()
     except asyncio.CancelledError:
         try:
             await _dock_send(0, 0)
@@ -1267,8 +1466,9 @@ async def _dock_cancel(reason: str):
 
 
 def _dock_status():
-    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"],
-            "sense": _dock["sense"], "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
+    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"],
+            "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
+            "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
             "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
 
 
@@ -1288,9 +1488,17 @@ async def dock_post(request: Request):
         await _dock_cancel("stopped by operator")
         return _dock_status()
     if action == "test":
-        # one frame, no motion — what the docker sees right now
-        frame = await feed_broadcasters["front"].get_frame(max_age=0.5, timeout=3.0, fps=5)
-        return {"sense": dock_sense(frame.jpeg) if frame else None}
+        # one frame from each camera, no motion — what the docker sees right now
+        out = {"front": None, "rear": None, "mirror": _dock["mirror"], "heading": _dock_heading()}
+        for cam in ("front", "rear"):
+            try:
+                if cam == "rear" and not await browser_service.has_rear_camera():
+                    out[cam] = {"error": "no rear camera"}; continue
+                fr = await feed_broadcasters[cam].get_frame(max_age=0.5, timeout=3.0, fps=5)
+                out[cam] = dock_see(fr.jpeg, cam) if fr else None
+            except Exception as e:
+                out[cam] = {"error": str(e)[:100]}
+        return {"sense": out}
     if _dock_active():
         return _dock_status()
     _dock["task"] = asyncio.create_task(_dock_loop())
