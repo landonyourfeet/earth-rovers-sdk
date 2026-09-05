@@ -1151,6 +1151,10 @@ DOCK = {
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "8")),         # ★ Cap (run 18): only turn around when STRAIGHT ON with the tag
     "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
     "axis_align_max": int(os.getenv("DOCK_AXIS_ALIGN_MAX", "6")),
+    # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
+    #   system is messing with the tires." All axis work happens OUT HERE: crab legs only run beyond
+    #   DOCK_AXIS_WORK_M, and a rover that is closer than that with yaw still on it RETREATS first.
+    "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "1.6")),
     # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
     #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
     #   ~25 cm from the stand, so the 180 happened ON the mat. The letter sheet is 12.6% wide at the 0.6 m staging
@@ -1624,6 +1628,23 @@ async def _dock_pulse_turn(direction: float, cam: str):
     return await _dock_settled_look(cam)
 
 
+async def _dock_retreat(learner, to_m: float):
+    """Back straight away from the dock, front camera holding the tag centered, until z ≥ to_m."""
+    _dock_set("retreat", "too close to fix the angle - backing out to %.1f m" % to_m)
+    t0 = time.time()
+    while time.time() - t0 < 12:
+        fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None; tag = see and see.get("tag")
+        if tag and tag.get("z_m") is not None and tag["z_m"] >= to_m:
+            break
+        ang = 0.0
+        if tag and abs(tag["x_err"]) >= 0.05:
+            ang = max(-0.2, min(0.2, -learner.sign() * tag["x_err"] * DOCK["turn_gain"]))   # reversing: opposite sense
+        await _dock_send(-DOCK["fwd_near"], ang)
+        _dock_log_tick("retreat", "z=%s" % (tag and tag.get("z_m")))
+        await asyncio.sleep(1.0 / DOCK["hz"])
+    await _dock_send(0, 0)
+
+
 async def _dock_axis_crab(learner, y0):
     """★ Cap (run 18, rover placed 45° off the dock): "it approached too close when not straight on, then
     tried the turn. It should only turn when directly straight on with the tag." A differential rover
@@ -1813,9 +1834,11 @@ async def _dock_stage_approach():
             # yaw glitch filter: median of the last three readings
             yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-3]
             yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
-            if z > 0.9 and abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
+            if abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                 await _dock_send(0, 0)
+                if z < DOCK["axis_work_m"]:
+                    await _dock_retreat(learner, DOCK["axis_work_m"])
                 _dock_set("axis", "getting onto the dock axis · yaw %+d° · crab %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
                 await _dock_axis_crab(learner, yaw_med)
                 _dock["_yaw_hist"] = []
@@ -1838,10 +1861,10 @@ async def _dock_stage_approach():
                     _dock_log_tick("approach")
                     await asyncio.sleep(1.0 / DOCK["hz"]); continue
                 if abs(yaw_med) > DOCK["yaw_ok_deg"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
-                    # close, centered, but not straight on: back off a leg and crab once more
+                    # close, centered, but not straight on: get right back out to working distance, then crab
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
-                    _dock_set("axis", "at staging distance but %+d° off axis - backing off to square up" % yaw_med)
-                    await _dock_send(-DOCK["fwd_near"], 0.0); await asyncio.sleep(0.6 / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                    _dock_set("axis", "at staging distance but %+d° off axis - backing out to square up" % yaw_med)
+                    await _dock_retreat(learner, DOCK["axis_work_m"])
                     await _dock_axis_crab(learner, yaw_med); _dock["_yaw_hist"] = []
                     continue
                 await _dock_send(0, 0)
