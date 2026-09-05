@@ -1081,6 +1081,7 @@ async def audio_feed():
 #   stand. Lost marker → stop, slow search turn, give up. Manual drive or
 #   ALL STOP aborts. Every tunable is a DOCK_* env var.
 import base64  # noqa: E402
+import re  # noqa: E402
 import math  # noqa: E402
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -1735,8 +1736,36 @@ async def _dock_cancel(reason: str):
             await t
 
 
+def _dock_progress():
+    """0–100 for the console's progress bar, from phase + what the tag says."""
+    ph = _dock["phase"] or ""; st = _dock["state"]; sn = _dock.get("sense") or {}; tag = sn.get("tag") or {}
+    if st == "docked": return 100
+    if ph in ("acquire",): return 3
+    if ph in ("lost", "search"): return 8 if _dock["cam"] == "front" else 68
+    if ph in ("stage", "approach", "align"):
+        d = tag.get("stage_dist_m") if tag.get("stage_dist_m") is not None else (tag.get("z_m") if tag.get("z_m") is not None else None)
+        if d is None: return 15
+        return int(max(15, min(42, 42 - min(d, 4.0) / 4.0 * 27)))
+    if ph in ("face", "square"): return 45
+    if ph == "staged": return 50
+    if ph == "turn":
+        try:
+            m = re.search(r"~(\d+)°", _dock.get("reason") or ""); t = float(m.group(1)) if m else 0.0
+        except Exception:
+            t = 0.0
+        return int(50 + min(t, 180) / 180 * 15)
+    if ph in ("turned", "turn_again"): return 65
+    if ph in ("align_rear", "back"):
+        z = tag.get("z_m")
+        if z is None: return 70
+        return int(max(70, min(90, 90 - min(max(z - 0.2, 0), 1.0) / 1.0 * 20)))
+    if ph == "final": return 93
+    if ph in ("contact", "nudge"): return 96
+    return 0
+
+
 def _dock_status():
-    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"],
+    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
             "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
             "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
             "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
