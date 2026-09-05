@@ -1057,6 +1057,24 @@ async def audio_feed():
     )
 
 
+@app.get("/rtc-config")
+async def rtc_config():
+    """★ OKCREAL (Sep 5, 2026 — Cap: "the Frodobots dashboard plays video awesome,
+    can we not have that quality?"). The dashboard joins the Agora channel as a
+    spectator and gets the rover's WebRTC stream directly — no screenshots,
+    no JPEG hops. This hands a Connect console the same spectator credentials
+    Frodobots issued to this SDK session so it can do exactly that."""
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    t = auth_response_data or {}
+    uid = t.get("SPECTATOR_USERID"); tok = t.get("SPECTATOR_RTC_TOKEN")
+    if not (t.get("APP_ID") and t.get("CHANNEL_NAME") and uid and tok):
+        raise HTTPException(status_code=404, detail="no spectator token in this session")
+    return {"app_id": t.get("APP_ID"), "channel": t.get("CHANNEL_NAME"), "uid": str(uid), "token": tok,
+            "front_uid": 1000, "rear_uid": 1001, "bot_uid": t.get("BOT_UID")}
+
+
 @app.get("/audio-status")
 async def audio_status():
     try:
