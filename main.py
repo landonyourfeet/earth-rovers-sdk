@@ -1080,6 +1080,7 @@ async def audio_feed():
 #   mat rails for the last stretch → DOCKED when the wheels stall against the
 #   stand. Lost marker → stop, slow search turn, give up. Manual drive or
 #   ALL STOP aborts. Every tunable is a DOCK_* env var.
+import math  # noqa: E402
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -1096,7 +1097,13 @@ DOCK = {
     "sheet_floor_y": float(os.getenv("DOCK_SHEET_FLOOR_Y", "0.70")),   # small blobs below this line are floor clutter, not the sheet
     "fwd": float(os.getenv("DOCK_FWD", "0.16")), "fwd_near": float(os.getenv("DOCK_FWD_NEAR", "0.10")),
     "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
-    "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "150")),   # tag side px @640 wide when it's time to turn (~1 m)
+    "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
+    "tag_m": float(os.getenv("DOCK_TAG_M", "0.1524")),              # printed tag side: 6 in
+    "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "110")),           # camera horizontal FOV estimate (Mini+ is wide)
+    "stage_m": float(os.getenv("DOCK_STAGE_M", "1.1")),             # staging point: this far out along the dock axis
+    "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.25")),
+    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
+    "sheet_stop_ratio": float(os.getenv("DOCK_SHEET_STOP_RATIO", "0.32")),  # hard stop: sheet this wide = we are at the stand
     "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
     "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.30")),
     "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")), "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
@@ -1169,14 +1176,44 @@ def dock_sense(jpeg):
 
 
 def _dock_find_tag(gray, w):
+    """Tag corners → bearing, size, and an approximate 3-D pose (metres, camera
+    frame: x right, y down, z forward). Intrinsics are estimated from the
+    camera's horizontal field of view (DOCK_HFOV_DEG) — good enough for a
+    staging point, and the sign of the lateral offset / yaw is what matters."""
     corners, ids, _ = _aruco.detectMarkers(gray)
     if ids is None:
         return None
+    h = gray.shape[0]
     for c, i in zip(corners, ids.ravel()):
-        if int(i) == DOCK["tag_id"]:
-            q = c[0]
-            side = float(max(np.linalg.norm(q[0] - q[1]), np.linalg.norm(q[1] - q[2])))
-            return {"cx": float(q[:, 0].mean()) / w, "cy": float(q[:, 1].mean()) / gray.shape[0], "side_px": round(side * (640.0 / w), 1)}
+        if int(i) != DOCK["tag_id"]:
+            continue
+        q = c[0]
+        side = float(max(np.linalg.norm(q[0] - q[1]), np.linalg.norm(q[1] - q[2])))
+        out = {"cx": float(q[:, 0].mean()) / w, "cy": float(q[:, 1].mean()) / h, "side_px": round(side * (640.0 / w), 1)}
+        try:
+            fx = (w / 2.0) / math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)
+            K = np.array([[fx, 0, w / 2.0], [0, fx, h / 2.0], [0, 0, 1]], dtype=np.float64)
+            L = DOCK["tag_m"] / 2.0
+            obj = np.array([[-L, L, 0], [L, L, 0], [L, -L, 0], [-L, -L, 0]], dtype=np.float64)
+            ok, rvec, tvec = cv2.solvePnP(obj, q.astype(np.float64), K, np.zeros(5), flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            if ok:
+                R, _ = cv2.Rodrigues(rvec)
+                t = tvec.ravel()
+                n = R[:, 2]                        # tag normal in camera coords
+                if float(np.dot(n, t)) > 0:        # make it point back toward the camera
+                    n = -n
+                out["x_m"] = round(float(t[0]), 3); out["z_m"] = round(float(t[2]), 3)
+                out["dist_m"] = round(float(np.linalg.norm(t)), 3)
+                # yaw of the dock relative to our line of sight: 0 = we are on its axis
+                out["yaw_deg"] = round(math.degrees(math.atan2(float(n[0]), float(-n[2]))), 1)
+                # staging point: DOCK_STAGE_M out along the dock's axis, in camera coords
+                P = t + n * DOCK["stage_m"]
+                out["stage_x_m"] = round(float(P[0]), 3); out["stage_z_m"] = round(float(P[2]), 3)
+                out["stage_bearing_deg"] = round(math.degrees(math.atan2(float(P[0]), float(P[2]))), 1)
+                out["stage_dist_m"] = round(float(math.hypot(P[0], P[2])), 3)
+        except Exception as e:
+            out["pose_error"] = str(e)[:60]
+        return out
     return None
 
 
@@ -1195,7 +1232,12 @@ def dock_see(jpeg: bytes, cam: str):
         t = _dock_find_tag(cv2.flip(gray, 1) if flipped else gray, w)
         if t:
             if flipped:
+                # geometry back into RAW-frame terms (raw image-right = rover's right on a mirrored feed)
                 t["cx"] = 1.0 - t["cx"]
+                for k in ("x_m", "stage_x_m"):
+                    if k in t: t[k] = round(-t[k], 3)
+                if "yaw_deg" in t: t["yaw_deg"] = round(-t["yaw_deg"], 1)
+                if "stage_bearing_deg" in t: t["stage_bearing_deg"] = round(-t["stage_bearing_deg"], 1)
             t["x_err"] = round(t["cx"] - 0.5, 3); t["mirrored"] = flipped
             if _dock["mirror"].get(cam) is None:
                 _dock["mirror"][cam] = flipped; logger.info("dock: %s camera is %s", cam, "MIRRORED" if flipped else "not mirrored")
@@ -1305,8 +1347,12 @@ class _SignLearner:
 
 
 async def _dock_stage_approach():
-    """Front cam, forward. Returns True when it's time to turn."""
-    learner = _SignLearner("front"); search_dir = 1.0
+    """Front cam, forward. Not "drive at the tag": drive to a STAGING POINT on the
+    dock's axis (DOCK_STAGE_M out from the stand), then face the dock squarely.
+    Returns True when it's time to turn around. Hard stops so it can never
+    plough into the stand: sheet filling the frame, tag closer than the
+    staging distance, or the tag too big when no pose is available."""
+    learner = _SignLearner("front"); search_dir = 1.0; faced_since = None
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -1314,6 +1360,13 @@ async def _dock_stage_approach():
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None
         _dock["sense"] = see; _dock["cam"] = "front"
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
+        # ---- hard stops ----
+        if sheet and sheet["ratio"] >= DOCK["sheet_stop_ratio"]:
+            await _dock_send(0, 0); _dock_set("staged", "at the stand (sheet fills the frame) — turning"); return True
+        if tag and tag.get("z_m") is not None and tag["z_m"] < DOCK["stage_m"] * 0.75 and abs(tag["x_err"]) < 0.2:
+            await _dock_send(0, 0); _dock_set("staged", "inside staging distance (%.2f m) — turning" % tag["z_m"]); return True
+        if tag and tag.get("z_m") is None and tag["side_px"] >= DOCK["tag_turn_px"]:
+            await _dock_send(0, 0); _dock_set("staged", "tag %dpx (no pose) — turning" % tag["side_px"]); return True
         tgt = tag or sheet
         if not tgt:
             if _dock["last_seen"] is None:
@@ -1325,11 +1378,41 @@ async def _dock_stage_approach():
                 _dock_set("search", "turning to find the dock"); await _dock_send(0, DOCK["search_turn"] * search_dir)
             else:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return False
+            faced_since = None
             await asyncio.sleep(1.0 / DOCK["hz"]); continue
         _dock["last_seen"] = now
+        # ---- with a pose: navigate to the staging point, then square up ----
+        if tag and tag.get("stage_dist_m") is not None:
+            sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
+            if sd > DOCK["stage_tol_m"]:
+                # bearing to the staging point drives the steering; forward when roughly pointed at it
+                err = max(-0.5, min(0.5, sb / 60.0))
+                angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * err * DOCK["turn_gain"] * 1.6))
+                linear = 0.0 if abs(sb) > 35 else (DOCK["fwd_near"] if sd < 0.6 else DOCK["fwd"])
+                _dock_set("stage", "to staging point · %.2f m, %+d° · dock yaw %+d°" % (sd, sb, yaw))
+                learner.observe(err, angular != 0.0); faced_since = None
+                await _dock_send(linear, angular)
+            else:
+                # at the staging point: rotate in place until the dock is centered and we're on its axis
+                x_err = tag["x_err"]
+                if abs(x_err) < DOCK["center_tol"] and abs(yaw) <= DOCK["yaw_ok_deg"]:
+                    faced_since = faced_since or now
+                    await _dock_send(0, 0)
+                    if now - faced_since > 0.6:
+                        _dock_set("staged", "on the dock axis (yaw %+d°) — turning" % yaw); return True
+                else:
+                    faced_since = None
+                    angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
+                    if abs(x_err) < DOCK["center_tol"] and abs(yaw) > DOCK["yaw_ok_deg"]:
+                        # centered but off-axis: back off a little on an arc to get onto the axis
+                        angular = DOCK["turn_max"] * 0.6 * (1 if yaw > 0 else -1) * learner.sign()
+                        await _dock_send(-DOCK["fwd_near"], angular); _dock_set("square", "squaring up · dock yaw %+d°" % yaw)
+                    else:
+                        await _dock_send(0, angular); _dock_set("face", "facing the dock · %+d%%" % int(x_err * 100))
+                    learner.observe(x_err, True)
+            await asyncio.sleep(1.0 / DOCK["hz"]); continue
+        # ---- no pose (sheet only, or tag without pose): bearing-only approach ----
         x_err = tgt["x_err"]; search_dir = 1.0 if x_err < 0 else -1.0
-        if tag and tag["side_px"] >= DOCK["tag_turn_px"] and abs(x_err) < DOCK["center_tol"] * 2:
-            await _dock_send(0, 0); return True
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
         if abs(x_err) > DOCK["turn_only"]:
             linear = 0.0; _dock_set("align", "centering the dock (front)")
@@ -1337,7 +1420,7 @@ async def _dock_stage_approach():
             if abs(x_err) < DOCK["center_tol"]:
                 angular = 0.0
             linear = DOCK["fwd_near"] if (tag and tag["side_px"] >= DOCK["tag_near_px"]) else DOCK["fwd"]
-            _dock_set("approach", "driving to the dock" + (" · tag %dpx" % tag["side_px"] if tag else " · sheet"))
+            _dock_set("approach", "driving to the dock" + (" · tag %dpx" % tag["side_px"] if tag else " · sheet %d%%" % int(sheet["ratio"] * 100)))
         learner.observe(x_err, angular != 0.0)
         await _dock_send(linear, angular)
         await asyncio.sleep(1.0 / DOCK["hz"])
@@ -1382,8 +1465,12 @@ async def _dock_stage_back():
         fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None
         _dock["sense"] = see; _dock["cam"] = "rear"
         tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
-        # steering reference, best first: tag → sheet → rails
-        if tag:
+        # steering reference, best first: tag pose (lateral offset + dock yaw) → tag bearing → sheet → rails
+        if tag and tag.get("x_m") is not None and tag.get("z_m"):
+            # error = where the dock axis crosses our path: lateral offset plus the yaw we're carrying
+            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * 0.8))
+            ref = "tag %.2fm lat %+.2f yaw %+d°" % (tag["z_m"], tag["x_m"], tag.get("yaw_deg", 0))
+        elif tag:
             x_err = tag["x_err"]; ref = "tag %dpx" % tag["side_px"]
         elif sheet and sheet["ratio"] >= DOCK["min_ratio"]:
             x_err = sheet["x_err"]; ref = "sheet %d%%" % int(sheet["ratio"] * 100)
@@ -1405,7 +1492,7 @@ async def _dock_stage_back():
             await asyncio.sleep(1.0 / DOCK["hz"]); continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
-        near = bool(tag and tag["side_px"] >= DOCK["tag_near_px"]) or bool(sheet and sheet["ratio"] >= 0.45)
+        near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
         if abs(x_err) > DOCK["turn_only"] and not near:
             linear = 0.0; _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
