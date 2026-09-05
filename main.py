@@ -1832,6 +1832,25 @@ async def rtc_config():
             "front_uid": 1000, "rear_uid": 1001, "bot_uid": t.get("BOT_UID")}
 
 
+@app.post("/talk")
+async def talk(request: Request):
+    """Live voice from a console: {"pcm_b64": <s16le mono>, "rate": 16000} per chunk; {"stop": true} ends."""
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    body = await request.json()
+    if body.get("stop"):
+        return {"result": await browser_service.talk_stop()}
+    b64 = body.get("pcm_b64")
+    if not b64:
+        raise HTTPException(status_code=400, detail="pcm_b64 required")
+    try:
+        chunks = await browser_service.talk_feed(b64, int(body.get("rate") or 16000))
+        return {"ok": True, "chunks": chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"talk failed: {str(e)[:120]}") from e
+
+
 @app.get("/audio-status")
 async def audio_status():
     try:
