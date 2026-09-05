@@ -15,7 +15,10 @@ logger = logging.getLogger("browser_service")
 # Configuration from environment variables with defaults
 FORMAT = os.getenv("IMAGE_FORMAT", "jpeg")
 QUALITY = float(os.getenv("IMAGE_QUALITY", "0.8"))
-FEED_QUALITY = float(os.getenv("FEED_JPEG_QUALITY", "0.8"))
+# ★ OKCREAL (Sep 5, 2026): feed frames scaled to FEED_WIDTH px wide at a lower
+#   JPEG quality — latency work, see captureFrameAsBase64 in basicVideoCall.js.
+FEED_QUALITY = float(os.getenv("FEED_JPEG_QUALITY", "0.55"))
+FEED_WIDTH = int(os.getenv("FEED_WIDTH", "640"))
 
 if FORMAT not in ["png", "jpeg", "webp"]:
     raise ValueError("Invalid image format. Supported formats: png, jpeg, webp")
@@ -301,16 +304,16 @@ class BrowserService:
     async def front_feed(self) -> dict:
         return await self._run(
             lambda page: page.evaluate(
-                "([quality]) => getFramePacket(1000, 'jpeg', quality)",
-                [FEED_QUALITY],
+                "([quality, width]) => getFramePacket(1000, 'jpeg', quality, width)",
+                [FEED_QUALITY, FEED_WIDTH],
             )
         )
 
     async def rear_feed(self) -> dict:
         return await self._run(
             lambda page: page.evaluate(
-                "([quality]) => getFramePacket(1001, 'jpeg', quality)",
-                [FEED_QUALITY],
+                "([quality, width]) => getFramePacket(1001, 'jpeg', quality, width)",
+                [FEED_QUALITY, FEED_WIDTH],
             )
         )
 
