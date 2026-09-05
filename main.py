@@ -1154,7 +1154,8 @@ DOCK = {
     # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
     #   system is messing with the tires." All axis work happens OUT HERE: crab legs only run beyond
     #   DOCK_AXIS_WORK_M, and a rover that is closer than that with yaw still on it RETREATS first.
-    "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "1.6")),
+    "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "2.0")),      # the FINAL APPROACH FIX: on the dock axis, this far out
+    "final_go_around_lat": float(os.getenv("DOCK_GO_AROUND_LAT", "0.12")),   # off the localizer on final → go around
     # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
     #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
     #   ~25 cm from the stand, so the 180 happened ON the mat. The letter sheet is 12.6% wide at the 0.6 m staging
@@ -1319,6 +1320,7 @@ def _dock_find_tag(gray, w, cam="front"):
                 n = R[:, 2]                        # tag normal in camera coords
                 if float(np.dot(n, t)) > 0:        # make it point back toward the camera
                     n = -n
+                n = n.copy(); n[0] *= _dock.get("_normal_sign", 1.0)   # lateral sign learned on the way (see _dock_goto_axis)
                 out["x_m"] = round(float(t[0]), 3); out["z_m"] = round(float(t[2]), 3)
                 out["dist_m"] = round(float(np.linalg.norm(t)), 3)
                 # yaw of the dock relative to our line of sight: 0 = we are on its axis
@@ -1645,6 +1647,60 @@ async def _dock_retreat(learner, to_m: float):
     await _dock_send(0, 0)
 
 
+async def _dock_goto_axis(learner):
+    """★ Cap's sketch (run 20): don't drive at the dock on a diagonal - drive to a point DIRECTLY IN
+    FRONT of it, then turn to face it and go straight in. The point is DOCK_AXIS_WORK_M out along the
+    dock's axis, computed from the tag pose. The one thing the pose can get wrong is which SIDE of the
+    tag the axis point lies on; that is checked after the first 40 cm - if the yaw grew, the sign flips
+    for the rest of the run. Returns True when we are near the axis point and facing the tag."""
+    t0 = time.time(); start_yaw = None; travelled = 0.0; checked = False; last_t = time.time()
+    _dock_set("axis", "driving to the point in front of the dock")
+    while time.time() - t0 < 40:
+        fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None; tag = see and see.get("tag")
+        if not tag or tag.get("stage_dist_m") is None:
+            see = await _dock_settled_look("front"); tag = see and see.get("tag")
+            if not tag or tag.get("stage_dist_m") is None:
+                await _dock_send(0, 0); return False
+        yaw = tag.get("yaw_deg") or 0.0
+        if start_yaw is None:
+            start_yaw = abs(yaw)
+        # recompute the axis point at the working distance (the pose helper used DOCK_STAGE_M)
+        z = tag["z_m"]; xm = tag["x_m"]
+        scale = DOCK["axis_work_m"] / max(DOCK["stage_m"], 0.05)
+        px = xm + (tag["stage_x_m"] - xm) * scale; pz = z + (tag["stage_z_m"] - z) * scale
+        dist = math.hypot(px, pz); bearing = math.degrees(math.atan2(px, pz))
+        if dist <= 0.30 or abs(xm) < 0.12 and abs(yaw) <= DOCK["yaw_ok_deg"]:
+            await _dock_send(0, 0); break
+        if z < 0.8:
+            await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"]); continue
+        if abs(bearing) > 25:
+            await _dock_pulse_turn(learner.sign() * (1 if bearing > 0 else -1) * 0.5, "front")
+            _dock_set("axis", "aiming at the axis point · %.1f m at %+d°" % (dist, bearing))
+            _dock_log_tick("axis", "aim b=%+d" % bearing); continue
+        ang = max(-0.25, min(0.25, learner.sign() * (bearing / 40.0)))
+        await _dock_send(DOCK["fwd"], ang)
+        now = time.time(); travelled += DOCK["fwd"] * ODO["mps_per_unit"] * (now - last_t); last_t = now
+        _dock_set("axis", "to the axis point · %.1f m at %+d° · dock yaw %+d°" % (dist, bearing, yaw))
+        _dock_log_tick("axis", "d=%.2f b=%+d yaw=%+d" % (dist, bearing, yaw))
+        if not checked and travelled >= 0.4:
+            checked = True
+            if abs(yaw) > start_yaw + 3:
+                _dock["_normal_sign"] = -_dock.get("_normal_sign", 1.0)
+                _docklog_event("sign_flip", "axis side was wrong (yaw %+d° → %+d°) - flipped" % (start_yaw, abs(yaw)))
+                travelled = 0.0; start_yaw = abs(yaw)
+        await asyncio.sleep(1.0 / DOCK["hz"])
+    await _dock_send(0, 0)
+    # face the tag
+    for _ in range(12):
+        see = await _dock_settled_look("front"); tag = see and see.get("tag")
+        if not tag:
+            return False
+        if abs(tag["x_err"]) < 0.08:
+            return True
+        await _dock_pulse_turn(learner.sign() * tag["x_err"], "front")
+    return True
+
+
 async def _dock_axis_crab(learner, y0):
     """★ Cap (run 18, rover placed 45° off the dock): "it approached too close when not straight on, then
     tried the turn. It should only turn when directly straight on with the tag." A differential rover
@@ -1839,8 +1895,10 @@ async def _dock_stage_approach():
                 await _dock_send(0, 0)
                 if z < DOCK["axis_work_m"]:
                     await _dock_retreat(learner, DOCK["axis_work_m"])
-                _dock_set("axis", "getting onto the dock axis · yaw %+d° · crab %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
-                await _dock_axis_crab(learner, yaw_med)
+                _dock_set("axis", "getting onto the dock axis · yaw %+d° · pass %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
+                ok = await _dock_goto_axis(learner)
+                if not ok:
+                    await _dock_axis_crab(learner, yaw_med)   # fallback: feedback-only crab
                 _dock["_yaw_hist"] = []
                 continue
             if not far_offaxis:
@@ -1853,9 +1911,19 @@ async def _dock_stage_approach():
                     _dock_log_tick("approach", "pulse")
                     continue
                 if z > DOCK["stage_m"] + 0.12:
+                    # ★ Cap: "an airplane lines up far from the runway, flies final, confirms lined up 2 ft out."
+                    #   This is final: the localizer is the dock axis. Drifting off it below 1.2 m is a GO-AROUND -
+                    #   back out to the fix and re-fly - never a fudge next to the stand.
+                    if z < 1.2 and (abs(yaw_med) > DOCK["yaw_ok_deg"] + 4 or abs(lat) > DOCK["final_go_around_lat"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                        _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
+                        _dock_set("go_around", "off the localizer on final (yaw %+d°, %+.0f cm) - going around" % (yaw_med, lat * 100))
+                        await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"])
+                        if not await _dock_goto_axis(learner):
+                            await _dock_axis_crab(learner, yaw_med)
+                        _dock["_yaw_hist"] = []; continue
                     ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
                     lin = DOCK["fwd_near"] if z < 1.0 else DOCK["fwd"]
-                    _dock_set("approach", "straight in · %.2f m · %+d%% · yaw %+d°" % (z, int(x_err * 100), yaw))
+                    _dock_set("final_approach", "on final · %.2f m · %+d%% · yaw %+d°" % (z, int(x_err * 100), yaw))
                     learner.observe(x_err, ang != 0.0)
                     await _dock_send(lin, ang)
                     _dock_log_tick("approach")
@@ -1865,7 +1933,9 @@ async def _dock_stage_approach():
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "at staging distance but %+d° off axis - backing out to square up" % yaw_med)
                     await _dock_retreat(learner, DOCK["axis_work_m"])
-                    await _dock_axis_crab(learner, yaw_med); _dock["_yaw_hist"] = []
+                    if not await _dock_goto_axis(learner):
+                        await _dock_axis_crab(learner, yaw_med)
+                    _dock["_yaw_hist"] = []
                     continue
                 await _dock_send(0, 0)
                 _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
@@ -2441,7 +2511,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": []})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
