@@ -1105,12 +1105,14 @@ DOCK = {
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
     "sheet_stop_ratio": float(os.getenv("DOCK_SHEET_STOP_RATIO", "0.32")),  # hard stop: sheet this wide = we are at the stand
     "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
-    "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.30")),
+    "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.42")),
     "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")), "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
-    "spin": float(os.getenv("DOCK_SPIN", "0.45")),               # 180° turn rate
+    "spin": float(os.getenv("DOCK_SPIN", "0.50")),               # 180° turn rate
+    "ang_min_inplace": float(os.getenv("DOCK_ANG_MIN_INPLACE", "0.38")),  # ★ Sep 5 run 2: 0.22 didn't turn the rover — motor dead zone
+    "ang_min_moving": float(os.getenv("DOCK_ANG_MIN_MOVING", "0.15")),
     "spin_tol_deg": float(os.getenv("DOCK_SPIN_TOL_DEG", "8")), "spin_timeout_s": float(os.getenv("DOCK_SPIN_TIMEOUT_S", "25")),
     "spin_blind_s": float(os.getenv("DOCK_SPIN_BLIND_S", "3.5")),   # no heading data: timed turn
-    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.22")), "search_s": float(os.getenv("DOCK_SEARCH_S", "25")),
+    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.40")), "search_s": float(os.getenv("DOCK_SEARCH_S", "25")),
     "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
@@ -1302,6 +1304,11 @@ def _dock_heading():
 
 
 async def _dock_send(linear: float, angular: float):
+    # motor dead zone: a small angular command doesn't move the rover at all
+    if angular:
+        floor = DOCK["ang_min_inplace"] if not linear else DOCK["ang_min_moving"]
+        if abs(angular) < floor:
+            angular = floor if angular > 0 else -floor
     cmd = {"linear": round(linear, 3), "angular": round(angular, 3), "lamp": 0}
     arm_control_watchdog(cmd)
     _dock["cmds"] += 1
@@ -1427,32 +1434,30 @@ async def _dock_stage_approach():
 
 
 async def _dock_stage_turn():
-    """180° about-face on the compass. Learns which way the heading moves."""
-    h0 = _dock_heading()
-    t0 = time.time()
-    if h0 is None:
-        _dock_set("turn", "no heading data — timed 180")
-        await _dock_send(0, DOCK["spin"] * _dock["sign"]["spin"])
-        await asyncio.sleep(DOCK["spin_blind_s"]); await _dock_send(0, 0); return True
-    target = (h0 + 180.0) % 360.0
-    def delta():
-        h = _dock_heading()
-        return None if h is None else ((h - target + 540.0) % 360.0) - 180.0
-    d_prev = delta(); sign = _dock["sign"]["spin"]; checked = False
-    _dock_set("turn", "180° turn: %d° → %d°" % (h0, target))
+    """About-face. ★ Sep 5 run 2: a compass-only 180 left the rover still facing
+    the dock (rear cam blind, 2 minutes of searching). The turn is now ended by
+    VISION: spin until the rear camera sees the tag or sheet near center; the
+    compass only reports progress. Up to ~400° of rotation before giving up."""
+    h0 = _dock_heading(); t0 = time.time(); turned = 0.0; hp = h0
+    sign = _dock["sign"]["spin"]
+    _dock_set("turn", "180° — spinning until the rear camera sees the dock")
     while True:
         if time.time() - t0 > DOCK["spin_timeout_s"]:
-            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_timeout", "180° turn did not complete"); return False
-        d = delta()
-        if d is not None and abs(d) <= DOCK["spin_tol_deg"]:
-            await _dock_send(0, 0); return True
-        if not checked and time.time() - t0 > 1.0 and d is not None and d_prev is not None:
-            checked = True
-            if abs(d) > abs(d_prev) + 2:   # heading moved the wrong way — flip and remember
-                sign *= -1; _dock["sign"]["spin"] = sign; logger.warning("dock: spin sign flipped to %+d", int(sign))
-        # shortest way round once we know the sign: steer toward reducing |d|
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_timeout", "spun for %ds without the rear camera finding the dock" % DOCK["spin_timeout_s"]); return False
         await _dock_send(0, DOCK["spin"] * sign)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.35)
+        h = _dock_heading()
+        if h is not None and hp is not None:
+            d = ((h - hp + 540.0) % 360.0) - 180.0; turned += abs(d); hp = h
+        fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None
+        _dock["sense"] = see; _dock["cam"] = "rear"
+        tag = see and see.get("tag"); sheet = see and see.get("sheet")
+        hit = (tag and abs(tag["x_err"]) < 0.22) or (sheet and abs(sheet["x_err"]) < 0.18 and sheet["ratio"] >= 0.03)
+        _dock_set("turn", "180° — turned ~%d°, rear cam: %s" % (turned, "TAG" if tag else "sheet" if sheet else "nothing yet"))
+        if hit:
+            await _dock_send(0, 0); _dock_set("turned", "rear camera has the dock (~%d° turned)" % turned); return True
+        if turned > 400:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_lost", "full circle and the rear camera never saw the dock"); return False
 
 
 async def _dock_stage_back():
@@ -1485,6 +1490,11 @@ async def _dock_stage_back():
             if lost < 1.5:
                 await _dock_send(0, 0); _dock_set("lost", "dock not in view (rear)")
             elif lost < 1.5 + DOCK["search_s"]:
+                # is the dock in FRONT of us? then the turn didn't take — go around again
+                if int(lost * 2) % 4 == 0:
+                    ffr = await _dock_frame("front"); fsee = dock_see(ffr.jpeg, "front") if ffr else None
+                    if fsee and (fsee.get("tag") or (fsee.get("sheet") and fsee["sheet"]["ratio"] >= 0.03)):
+                        await _dock_send(0, 0); _dock_set("turn_again", "dock is in front of us — turning around again"); return "turn"
                 _dock_set("search", "turning to find the dock (rear)"); await _dock_send(0, DOCK["search_turn"] * search_dir)
             else:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "lost the dock while backing in"); return False
@@ -1518,10 +1528,14 @@ async def _dock_loop():
         if not await _dock_stage_approach():
             return
         _dock["last_seen"] = None
-        if not await _dock_stage_turn():
-            return
-        _dock["last_seen"] = None
-        await _dock_stage_back()
+        for attempt in range(3):
+            if not await _dock_stage_turn():
+                return
+            _dock["last_seen"] = None
+            r = await _dock_stage_back()
+            if r != "turn":
+                return
+        _dock["state"] = "failed"; _dock_set("turn_lost", "could not get the rear camera onto the dock after 3 turns")
     except asyncio.CancelledError:
         try:
             await _dock_send(0, 0)
