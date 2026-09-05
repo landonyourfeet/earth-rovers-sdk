@@ -664,6 +664,48 @@ async function setAudioTap(on) {
 }
 function audioTapStatus() { return { want: _audioTapWant, on: !!_audioTap, track: !!_roverAudioTrack() }; }
 window.setAudioTap = setAudioTap;
+
+// ★ OKCREAL (Sep 5, 2026 — Cap: "the original Frodobots dashboard let you talk
+//   through your browser in your voice through the robot"). Live TALK relay:
+//   the console streams 16 kHz PCM chunks → SDK /talk → this page, which plays
+//   them into a custom Agora audio track published under the DRIVER credential
+//   (the spectator token a console joins with may not carry publish rights).
+//   Track is published on the first chunk and dropped after 2 s of silence.
+let _talk = null, _talkIdleT = null;
+async function _talkStart() {
+  if (_talk) return _talk;
+  const ctx = new AudioContext({ sampleRate: 48000 });
+  if (ctx.state === "suspended") await ctx.resume();
+  const dest = ctx.createMediaStreamDestination();
+  const track = AgoraRTC.createCustomAudioTrack({ mediaStreamTrack: dest.stream.getAudioTracks()[0] });
+  await client.publish(track);
+  _talk = { ctx, dest, track, nextT: 0, chunks: 0 };
+  return _talk;
+}
+async function _talkStop() {
+  const t = _talk; _talk = null;
+  if (!t) return "idle";
+  try { await client.unpublish(t.track); t.track.close(); } catch (e) {}
+  try { await t.ctx.close(); } catch (e) {}
+  return "stopped";
+}
+async function talkFeed(b64, rate) {
+  const t = await _talkStart();
+  const bin = atob(b64); const n = bin.length >> 1; const pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) pcm[i] = (bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8)) << 16 >> 16;
+  const sr = rate || 16000;
+  const buf = t.ctx.createBuffer(1, n, sr); const ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = pcm[i] / 32768;
+  const src = t.ctx.createBufferSource(); src.buffer = buf; src.connect(t.dest);
+  const now = t.ctx.currentTime; if (t.nextT < now + 0.05) t.nextT = now + 0.25;
+  src.start(t.nextT); t.nextT += n / sr; t.chunks++;
+  if (_talkIdleT) clearTimeout(_talkIdleT);
+  _talkIdleT = setTimeout(() => { _talkStop(); }, 2000);
+  return t.chunks;
+}
+window.talkFeed = talkFeed;
+window.talkStop = _talkStop;
+window.talkStatus = () => ({ live: !!_talk, chunks: _talk ? _talk.chunks : 0 });
 window.audioTapStatus = audioTapStatus;
 
 // ★ OKCREAL (Sep 4, 2026): play a LIVE audio stream (e.g. an internet radio
