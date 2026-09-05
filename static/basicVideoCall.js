@@ -406,18 +406,50 @@ function getCodec() {
 
 const captureSurfaces = new WeakMap();
 
-async function captureFrameAsBase64(videoTrack, imageFormat, imageQuality) {
-  const frame = await videoTrack.getCurrentFrameData();
-  if (!frame) return null;
+// ★ OKCREAL (Sep 5, 2026 — Cap: "camera feed is glitchy, delayed too much for
+//   navigation"). Upstream copied every frame at full resolution through
+//   getCurrentFrameData → putImageData → toDataURL at q0.8: ~150–250 KB per
+//   frame, 2–3 MB/s at 12 fps, and every hop after it (CDP, Python, Connect,
+//   the phone) queued behind that. Now: draw straight from the playing <video>
+//   (no pixel copy), scaled to maxWidth, so a feed frame is ~20–35 KB.
+function _liveVideoEl(videoTrack) {
+  try {
+    const mst = videoTrack.getMediaStreamTrack && videoTrack.getMediaStreamTrack();
+    for (const v of document.querySelectorAll("video")) {
+      const so = v.srcObject;
+      if (so && mst && so.getVideoTracks && so.getVideoTracks().includes(mst) && v.videoWidth > 0) return v;
+    }
+  } catch (e) {}
+  return null;
+}
+async function captureFrameAsBase64(videoTrack, imageFormat, imageQuality, maxWidth) {
   let surface = captureSurfaces.get(videoTrack);
   if (!surface) {
     const canvas = document.createElement("canvas");
-    surface = { canvas: canvas, context: canvas.getContext("2d") };
+    surface = { canvas: canvas, context: canvas.getContext("2d", { alpha: false }) };
     captureSurfaces.set(videoTrack, surface);
   }
-  if (surface.canvas.width !== frame.width) surface.canvas.width = frame.width;
-  if (surface.canvas.height !== frame.height) surface.canvas.height = frame.height;
-  surface.context.putImageData(frame, 0, 0);
+  const vid = _liveVideoEl(videoTrack);
+  let sw, sh, source, frame = null;
+  if (vid) { sw = vid.videoWidth; sh = vid.videoHeight; source = vid; }
+  else {
+    frame = await videoTrack.getCurrentFrameData();
+    if (!frame) return null;
+    sw = frame.width; sh = frame.height;
+  }
+  const scale = maxWidth && sw > maxWidth ? maxWidth / sw : 1;
+  const w = Math.max(2, Math.round(sw * scale)), h = Math.max(2, Math.round(sh * scale));
+  if (surface.canvas.width !== w) surface.canvas.width = w;
+  if (surface.canvas.height !== h) surface.canvas.height = h;
+  if (source) surface.context.drawImage(source, 0, 0, w, h);
+  else if (scale === 1) surface.context.putImageData(frame, 0, 0);
+  else {
+    if (!surface.full) { surface.full = document.createElement("canvas"); surface.fullCtx = surface.full.getContext("2d"); }
+    if (surface.full.width !== sw) surface.full.width = sw;
+    if (surface.full.height !== sh) surface.full.height = sh;
+    surface.fullCtx.putImageData(frame, 0, 0);
+    surface.context.drawImage(surface.full, 0, 0, w, h);
+  }
   const params = window.imageParams || { imageFormat: "jpeg", imageQuality: 0.8 };
   return surface.canvas.toDataURL(
     `image/${imageFormat || params.imageFormat}`,
@@ -437,7 +469,7 @@ async function getLastBase64Frame(uid) {
 
 // Capture once and attach the capture time. The feed explicitly requests
 // JPEG, while the v2 endpoints retain IMAGE_FORMAT compatibility.
-async function getFramePacket(uid, imageFormat, imageQuality) {
+async function getFramePacket(uid, imageFormat, imageQuality, maxWidth) {
   const user = remoteUsers[uid];
   if (!user || !user.videoTrack || !user.videoTrack.captureEnabled) {
     return null;
@@ -448,7 +480,8 @@ async function getFramePacket(uid, imageFormat, imageQuality) {
     const base64Frame = await captureFrameAsBase64(
       user.videoTrack,
       imageFormat,
-      imageQuality
+      imageQuality,
+      maxWidth
     );
     if (!base64Frame) return null;
     return { data_url: base64Frame, timestamp: capturedAt };
