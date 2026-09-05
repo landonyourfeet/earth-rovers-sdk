@@ -1167,7 +1167,7 @@ DOCK = {
     "pulse_s": float(os.getenv("DOCK_PULSE_S", "0.5")),          # rotate this long per pulse
     "settle_s": float(os.getenv("DOCK_SETTLE_S", "0.45")),        # stop this long before looking
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
-    "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "1")),      # rear cam (raw/mirrored frame), reversing
+    "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "-1")),     # ★ run 7 log: +1 drove the lateral offset from -8 cm to -21 cm; the learner flipped it to -1
 }
 # ★ Sep 5, 2026 (Cap: "create a diagnostic download so you can see the events").
 #   Every run keeps a flight log: phase changes, every control tick (what each
@@ -1554,7 +1554,7 @@ class _SignLearner:
                 self.bad += 1
             else:
                 self.bad = 0
-            if self.bad >= 4:
+            if self.bad >= 3:
                 _dock["sign"][self.cam] *= -1; self.bad = 0
                 logger.warning("dock: %s steering sign flipped to %+d (error kept growing)", self.cam, int(_dock["sign"][self.cam]))
                 _docklog_event("sign_flip", "%s steering sign → %+d" % (self.cam, int(_dock["sign"][self.cam])))
@@ -1772,6 +1772,12 @@ async def _dock_stage_back():
             continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
+        if tag and tag.get("z_m") is not None and tag.get("x_m") is not None and tag["z_m"] < 0.65 and abs(tag["x_m"]) > 0.10 and reseats < DOCK["reseat_max"]:
+            # ★ run 7 log: 21 cm off-axis at 0.5 m cannot be steered out while reversing - go around again
+            reseats += 1
+            _dock_set("reseat", "%.0f cm off the dock axis at %.2f m - pulling forward to re-approach (%d/%d)" % (abs(tag["x_m"]) * 100, tag["z_m"], reseats, DOCK["reseat_max"]))
+            await _dock_send(DOCK["fwd_near"], -learner.sign() * 0.25 * (1 if tag["x_m"] > 0 else -1)); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+            rev_since = None; _dock["last_seen"] = None; continue
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
         tol = DOCK["center_tol"] * (0.6 if near else 1.0)   # tighter as the stand gets close
@@ -1784,7 +1790,17 @@ async def _dock_stage_back():
             _dock_set("back", "backing onto the mat · " + ref)
             rev_since = rev_since or now
             if now - rev_since > DOCK["stall_s"] and _dock_rpms_zero():
-                await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "wheels stalled against the stand"); return True
+                # ★ run 7 log: "docked - wheels stalled" fired 50 cm from the sheet, turned 45°, stuck on the
+                #   mat edge. A stall only counts at the stand: the sheet must be filling the frame.
+                seat = dock_seat(fr.jpeg) if fr else None
+                if seat or (tag and tag.get("z_m") is not None and tag["z_m"] <= DOCK["final_z_m"]):
+                    await _dock_send(0, 0); return await _dock_final(tag["z_m"] if tag and tag.get("z_m") is not None else DOCK["final_z_m"])
+                if reseats < DOCK["reseat_max"]:
+                    reseats += 1
+                    _dock_set("stuck", "wheels stalled %.2f m from the stand - pulling forward to try again (%d/%d)" % ((tag or {}).get("z_m") or 0, reseats, DOCK["reseat_max"]))
+                    await _dock_send(DOCK["fwd_near"], 0.0); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                    rev_since = None; _dock["last_seen"] = None; continue
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("stuck", "stalled short of the stand %d times - something is in the way" % DOCK["reseat_max"]); return False
         learner.observe(x_err, angular != 0.0)
         await _dock_send(linear, angular)
         _dock_log_tick("back", ref)
