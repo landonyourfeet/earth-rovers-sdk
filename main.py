@@ -1391,8 +1391,9 @@ def dock_see(jpeg: bytes, cam: str):
 
 
 def dock_seat(jpeg: bytes):
-    """At the stand the tag is unreadable (clipped), but its black square is the best ruler we have:
-    its center gives lateral offset, its width gives depth. Returns None when no big dark square is seen."""
+    """At the stand the tag is unreadable (clipped). Flyer v2 carries SEAT MARKS on a white band under
+    the tag: a 3-inch center bar (lateral offset) and two stripes 6 inches apart (depth gauge). Those are
+    read first; the v1 fallback is the tag's black square (center = offset, width = depth)."""
     img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return None
@@ -1402,14 +1403,32 @@ def dock_seat(jpeg: bytes):
     if mag.mean() / 255.0 < 0.15:
         return None                     # the sheet is not filling the frame - not at the stand
     dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 95))
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    cs, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    # --- v2 marks: look in the lower half of the frame for the white band and its three black blocks
+    lower = dark[h // 2:, :]
+    cs, _ = cv2.findContours(lower, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blobs = []
+    for c in cs:
+        x, y, bw, bh = cv2.boundingRect(c)
+        if bh < 4 or bw < 4 or bw / float(w) > 0.45:
+            continue
+        blobs.append({"cx": (x + bw / 2.0) / w, "cy": (h // 2 + y + bh / 2.0) / h, "w": bw / float(w), "h": bh / float(h), "asp": bw / float(bh)})
+    if len(blobs) >= 3:
+        bars = [b for b in blobs if b["asp"] >= 2.5 and 0.15 <= b["w"] <= 0.45]           # the wide center bar
+        stripes = sorted([b for b in blobs if b["asp"] <= 0.9 and b["w"] <= 0.12], key=lambda b: b["cx"])   # tall thin stripes
+        if bars and len(stripes) >= 2:
+            bar = max(bars, key=lambda b: b["w"])
+            left = min(stripes, key=lambda b: b["cx"]); right = max(stripes, key=lambda b: b["cx"])
+            if right["cx"] - left["cx"] > 0.3:
+                return {"v": 2, "cx": round(bar["cx"] - 0.5, 3), "width": round(right["cx"] - left["cx"], 3), "bottom_y": round(bar["cy"], 3)}
+    # --- v1 fallback: the tag's black square
+    cs, _ = cv2.findContours(cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
         return None
     c = max(cs, key=cv2.contourArea); x, y, bw, bh = cv2.boundingRect(c)
     if bw / float(w) < 0.3:
         return None
-    return {"cx": round((x + bw / 2.0) / w - 0.5, 3), "width": round(bw / float(w), 3), "bottom_y": round((y + bh) / float(h), 3)}
+    return {"v": 1, "cx": round((x + bw / 2.0) / w - 0.5, 3), "width": round(bw / float(w), 3), "bottom_y": round((y + bh) / float(h), 3)}
 
 
 def _dock_rpms_zero() -> bool:
