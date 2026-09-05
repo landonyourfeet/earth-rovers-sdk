@@ -901,6 +901,65 @@ async def control(request: Request):
         raise HTTPException(status_code=500, detail=detail) from e
 
 
+# ★ OKCREAL (Sep 4, 2026): play / stop a live audio stream on the rover
+#   speaker (OKCREAL Radio). Body: {"url": "https://.../stream"}.
+# ★ OKCREAL (Sep 4, 2026): STANDBY / WAKE. While the SDK page is joined, the
+#   rover streams video into the channel around the clock — battery and data
+#   for nobody. Standby tears the page down (rover goes quiet, no session);
+#   wake rejoins. Connect calls standby when no console has been open for a
+#   while and wake when one opens.
+@app.post("/standby")
+async def standby():
+    try:
+        await browser_service.close()
+        return {"message": "standby", "browser_ready": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"standby failed: {str(e)}") from e
+
+
+@app.post("/wake")
+async def wake():
+    try:
+        ok = await browser_service.warmup(max_attempts=3)
+        return {"message": "awake" if ok else "wake failed", "browser_ready": bool(ok)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"wake failed: {str(e)}") from e
+
+
+@app.post("/play-live")
+async def play_live(request: Request):
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    body = await request.json()
+    url = body.get("url")
+    if not url or not str(url).startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="url required (http/https)")
+    try:
+        result = await browser_service.play_live(str(url))
+        return {"message": "Live audio started", "result": result}
+    except Exception as e:
+        logger.error("Error in /play-live: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"live audio failed: {str(e)}") from e
+
+
+@app.post("/stop-live")
+async def stop_live():
+    try:
+        result = await browser_service.stop_live()
+        return {"message": "Live audio stopped", "result": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"stop failed: {str(e)}") from e
+
+
+@app.get("/live-status")
+async def live_status():
+    try:
+        return await browser_service.live_status() or {"playing": False}
+    except Exception:
+        return {"playing": False}
+
+
 @app.post("/speak")
 async def speak(request: Request):
     await need_start_mission()
