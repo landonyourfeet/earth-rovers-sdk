@@ -364,6 +364,27 @@ class BrowserService:
         async with self._get_lock():
             await self._teardown()
 
+    # ★ OKCREAL (Sep 4, 2026): live stream to the rover speaker.
+    async def play_live(self, stream_url: str):
+        return await self._run(
+            lambda page: page.evaluate(
+                "async (u) => await window.playLiveAudioToRover(u)", stream_url
+            ),
+            retry_on_disconnect=False,
+        )
+
+    async def stop_live(self):
+        return await self._run(
+            lambda page: page.evaluate("async () => await window.stopLiveAudioToRover()"),
+            retry_on_disconnect=False,
+        )
+
+    async def live_status(self):
+        return await self._run(
+            lambda page: page.evaluate("() => window.liveAudioStatus()"),
+            retry_on_disconnect=False,
+        )
+
     async def speak(self, audio_url: str):
         return await self._run(
             lambda page: page.evaluate(
