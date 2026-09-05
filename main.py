@@ -1124,8 +1124,8 @@ DOCK = {
     "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
     "tag_m": float(os.getenv("DOCK_TAG_M", "0.1524")),              # printed tag side: 6 in
     "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "110")),           # camera horizontal FOV estimate (Mini+ is wide)
-    "stage_m": float(os.getenv("DOCK_STAGE_M", "1.1")),             # staging point: this far out along the dock axis
-    "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.25")),
+    "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
+    "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
     "sheet_stop_ratio": float(os.getenv("DOCK_SHEET_STOP_RATIO", "0.32")),  # hard stop: sheet this wide = we are at the stand
     "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
@@ -1567,7 +1567,7 @@ async def _dock_stage_approach():
             #   rover spun in place hunting it, losing the tag three times. Close to the point, the bearing is
             #   meaningless — what matters is being about DOCK_STAGE_M from the tag, facing it, near its axis.
             z = tag.get("z_m") or 0.0
-            near_band = abs(z - DOCK["stage_m"]) <= 0.45 and abs(tag["x_err"]) < 0.22 and abs(yaw) <= DOCK["yaw_ok_deg"] * 1.5
+            near_band = abs(z - DOCK["stage_m"]) <= 0.25 and abs(tag["x_err"]) < 0.22 and abs(yaw) <= DOCK["yaw_ok_deg"] * 1.5
             if sd > DOCK["stage_tol_m"] and not (sd < 0.6 and abs(sb) > 45) and not near_band:
                 # bearing to the staging point drives the steering; forward when roughly pointed at it
                 err = max(-0.5, min(0.5, sb / 60.0))
