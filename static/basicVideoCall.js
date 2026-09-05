@@ -502,8 +502,19 @@ window.toggleRemoteAudio = toggleRemoteAudio;
  * Play an audio file through the Agora RTC channel so it reaches the rover's speaker.
  * @param {string} audioUrl - URL to the audio file (served from /static/)
  */
-async function playAudioToRover(audioUrl) {
-  const response = await fetch(audioUrl);
+// ★ OKCREAL (Sep 5, 2026): calls are chained so two utterances can never publish
+//   two audio tracks at once; the fetch bypasses the page cache so a fresh clip is
+//   never replaced by a previously played one at the same URL.
+let _speakChain = Promise.resolve();
+function playAudioToRover(audioUrl) {
+  const run = () => _playAudioToRoverNow(audioUrl);
+  const p = _speakChain.then(run, run);
+  _speakChain = p.catch(() => {});
+  return p;
+}
+async function _playAudioToRoverNow(audioUrl) {
+  const response = await fetch(audioUrl, { cache: "no-store" });
+  if (!response.ok) throw new Error("tts fetch " + response.status);
   const arrayBuffer = await response.arrayBuffer();
   const audioContext = new AudioContext({ sampleRate: 48000 });
 
@@ -555,6 +566,72 @@ async function playAudioToRover(audioUrl) {
   });
 }
 window.playAudioToRover = playAudioToRover;
+
+// ★ OKCREAL (Sep 5, 2026 — Cap: "activate the rover's microphone so I can hear
+//   the environment"). The rover already publishes its mic into the Agora
+//   channel (this page plays it, silently, in the headless browser). This tap
+//   pulls that remote audio track, downsamples 48 kHz → 16 kHz PCM16 mono, and
+//   pushes it to the SDK server over a local WebSocket (/ws/audio-ingest, same
+//   ingest token the telemetry push uses) so GET /audio-feed can stream it out.
+let _audioTap = null, _audioTapWant = false, _audioTapRetry = null;
+function _roverAudioTrack() {
+  for (const u of Object.values(remoteUsers || {})) if (u && u.audioTrack) return u.audioTrack;
+  return null;
+}
+async function _audioTapStart() {
+  if (_audioTap) return "on";
+  const track = _roverAudioTrack();
+  if (!track) throw new Error("rover audio track not subscribed yet");
+  const mst = track.getMediaStreamTrack();
+  const tokEl = document.getElementById("ingest_token");
+  const tok = tokEl ? tokEl.value : "";
+  const ctx = new AudioContext({ sampleRate: 48000 });
+  if (ctx.state === "suspended") await ctx.resume();
+  const src = ctx.createMediaStreamSource(new MediaStream([mst]));
+  const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const sink = ctx.createGain(); sink.gain.value = 0;
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/audio-ingest?token=" + encodeURIComponent(tok));
+  ws.binaryType = "arraybuffer";
+  proc.onaudioprocess = (e) => {
+    if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 256 * 1024) return;
+    const f = e.inputBuffer.getChannelData(0);
+    const n = Math.floor(f.length / 3);
+    const out = new Int16Array(n);
+    for (let i = 0; i < n; i++) {
+      const v = (f[3 * i] + f[3 * i + 1] + f[3 * i + 2]) / 3;
+      out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+    }
+    ws.send(out.buffer);
+  };
+  src.connect(proc); proc.connect(sink); sink.connect(ctx.destination);
+  _audioTap = { ctx, src, proc, sink, ws };
+  ws.onclose = () => { if (_audioTap && _audioTap.ws === ws) { _audioTapTeardown(); if (_audioTapWant) _audioTapSchedule(); } };
+  return "on";
+}
+function _audioTapTeardown() {
+  const t = _audioTap; _audioTap = null;
+  if (!t) return;
+  try { t.proc.onaudioprocess = null; t.src.disconnect(); t.proc.disconnect(); t.sink.disconnect(); } catch (e) {}
+  try { if (t.ws.readyState <= 1) t.ws.close(); } catch (e) {}
+  try { t.ctx.close(); } catch (e) {}
+}
+function _audioTapSchedule() {
+  if (_audioTapRetry) return;
+  _audioTapRetry = setTimeout(async () => {
+    _audioTapRetry = null;
+    if (!_audioTapWant || _audioTap) return;
+    try { await _audioTapStart(); } catch (e) { _audioTapSchedule(); }
+  }, 2000);
+}
+async function setAudioTap(on) {
+  _audioTapWant = !!on;
+  if (!on) { if (_audioTapRetry) { clearTimeout(_audioTapRetry); _audioTapRetry = null; } _audioTapTeardown(); return "off"; }
+  try { return await _audioTapStart(); }
+  catch (e) { _audioTapSchedule(); return "waiting: " + e.message; }
+}
+function audioTapStatus() { return { want: _audioTapWant, on: !!_audioTap, track: !!_roverAudioTrack() }; }
+window.setAudioTap = setAudioTap;
+window.audioTapStatus = audioTapStatus;
 
 // ★ OKCREAL (Sep 4, 2026): play a LIVE audio stream (e.g. an internet radio
 //   station) through the rover speaker until stopped. playAudioToRover fetches
