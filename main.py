@@ -1161,10 +1161,16 @@ DOCK = {
     "search_pulse_s": float(os.getenv("DOCK_SEARCH_PULSE_S", "0.8")),
     "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
+    # ★ Cap: "are you sure we are not misreading the quality of the camera feed?" The viewer feed is
+    #   scaled to 640 px for bandwidth; the docker no longer uses that for the front camera - it takes
+    #   its own capture at DOCK_FRONT_WIDTH (the front publishes 1024 wide). The rear camera's native
+    #   width is whatever the rover publishes (measured by SIGHT → "native"); nothing upscales it.
+    "front_width": int(os.getenv("DOCK_FRONT_WIDTH", "1024")),
     # ★ Sep 5 (Cap: "it's trying to find the image while moving which causes blur"):
     #   turns and searches PULSE — rotate, stop, settle, look — and a lost marker
     #   is only declared lost from a settled (stopped) frame.
     "pulse_s": float(os.getenv("DOCK_PULSE_S", "0.5")),          # rotate this long per pulse
+    "pulse_turn_s": float(os.getenv("DOCK_PULSE_TURN_S", "0.18")),   # alignment pulse (a few degrees), then settle and look
     "settle_s": float(os.getenv("DOCK_SETTLE_S", "0.45")),        # stop this long before looking
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
     "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "-1")),     # ★ run 7 log: +1 drove the lateral offset from -8 cm to -21 cm; the learner flipped it to -1
@@ -1431,6 +1437,20 @@ def dock_seat(jpeg: bytes):
     return {"v": 1, "cx": round((x + bw / 2.0) / w - 0.5, 3), "width": round(bw / float(w), 3), "bottom_y": round((y + bh) / float(h), 3)}
 
 
+async def _dock_native_dims():
+    """What resolution each camera is REALLY delivering (from the <video> elements in the SDK page)."""
+    try:
+        return await browser_service._run(lambda p: p.evaluate("""() => {
+            const out = {};
+            for (const [uid, u] of Object.entries(window.remoteUsers || {})) {
+              const v = document.querySelector('#player-' + uid + ' video');
+              out[uid] = v ? { w: v.videoWidth, h: v.videoHeight } : null;
+            }
+            return out; }"""), retry_on_disconnect=False)
+    except Exception as e:
+        return {"error": str(e)[:80]}
+
+
 def _dock_rpms_zero() -> bool:
     d = telemetry_hub.latest or {}
     rp = d.get("rpms") or []
@@ -1479,10 +1499,33 @@ def _dock_set(phase, reason=None):
         _dock["reason"] = reason
 
 
+class _Frame:
+    __slots__ = ("jpeg",)
+    def __init__(self, jpeg): self.jpeg = jpeg
+
+
+async def _dock_capture(cam: str, width: int):
+    """Direct capture from the SDK page at the requested width (independent of the viewer feed)."""
+    uid = 1000 if cam == "front" else 1001
+    packet = await browser_service._run(
+        lambda page: page.evaluate("([uid, q, w]) => getFramePacket(uid, 'jpeg', q, w)", [uid, 0.7, width]),
+        retry_on_disconnect=False,
+    )
+    if not packet or not packet.get("data_url"):
+        return None
+    b64 = packet["data_url"]
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    return _Frame(base64.b64decode(b64))
+
+
 async def _dock_frame(cam: str):
-    b = feed_broadcasters[cam]
+    fr = None
     try:
-        fr = await b.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
+        if cam == "front" and DOCK["front_width"] > 640:
+            fr = await _dock_capture("front", DOCK["front_width"])
+        else:
+            fr = await feed_broadcasters[cam].get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
     except Exception as e:
         logger.warning("dock: %s frame error: %s", cam, e)
         _docklog_event("frame_error", cam + ": " + str(e)[:100]); return None
@@ -1496,9 +1539,11 @@ async def _dock_settled_look(cam: str):
     """Stop, let the camera settle, take a FRESH frame, and sense it."""
     await _dock_send(0, 0)
     await asyncio.sleep(DOCK["settle_s"])
-    b = feed_broadcasters[cam]
     try:
-        fr = await b.get_frame(max_age=0.15, timeout=2.0, fps=int(DOCK["hz"]))
+        if cam == "front" and DOCK["front_width"] > 640:
+            fr = await _dock_capture("front", DOCK["front_width"])
+        else:
+            fr = await feed_broadcasters[cam].get_frame(max_age=0.15, timeout=2.0, fps=int(DOCK["hz"]))
     except Exception as e:
         _docklog_event("frame_error", cam + " (settled): " + str(e)[:100]); fr = None
     _dock["_last_frame"] = (cam, fr.jpeg if fr else None)
@@ -1540,6 +1585,15 @@ async def _dock_search(primary_cam: str):
     await _dock_send(0, 0)
     _docklog_event("search_miss", "full sweep (~%d°) with no dock in either camera" % turned)
     return None
+
+
+async def _dock_pulse_turn(direction: float, cam: str):
+    """★ run 8 log: continuous in-place turns at the dead-zone floor (0.38–0.42) overshot by 10–30° per
+    tick and the rover hunted left-right for a minute, then stalled sideways on the mat. Alignment
+    turns are now PULSES: a short burst, stop, settle, look again."""
+    await _dock_send(0, DOCK["ang_min_inplace"] * (1 if direction > 0 else -1))
+    await asyncio.sleep(DOCK["pulse_turn_s"])
+    return await _dock_settled_look(cam)
 
 
 class _SignLearner:
@@ -1619,7 +1673,30 @@ async def _dock_stage_approach():
             faced_since = None
             continue
         _dock["last_seen"] = now
-        # ---- with a pose: navigate to the staging point, then square up ----
+        # ---- with a pose ----
+        if tag and tag.get("z_m") is not None:
+            z = tag["z_m"]; yaw = tag.get("yaw_deg", 0.0); x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
+            far_offaxis = z > 1.5 and abs(lat) > 0.20 and tag.get("stage_dist_m") is not None
+            if not far_offaxis:
+                # ★ run 8 log: at 1.0 m, centered, it spun 90° chasing a staging point 40 cm away. When the tag
+                #   is in front of us the plan is simple: pulse to center it, then drive straight until DOCK_STAGE_M.
+                if abs(x_err) > 0.12:
+                    _dock_set("face", "centering the dock · %+d%%" % int(x_err * 100))
+                    see = await _dock_pulse_turn(learner.sign() * x_err, "front")
+                    learner.observe(x_err, True)
+                    _dock_log_tick("approach", "pulse")
+                    continue
+                if z > DOCK["stage_m"] + 0.12:
+                    ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
+                    lin = DOCK["fwd_near"] if z < 1.0 else DOCK["fwd"]
+                    _dock_set("approach", "straight in · %.2f m · %+d%% · yaw %+d°" % (z, int(x_err * 100), yaw))
+                    learner.observe(x_err, ang != 0.0)
+                    await _dock_send(lin, ang)
+                    _dock_log_tick("approach")
+                    await asyncio.sleep(1.0 / DOCK["hz"]); continue
+                await _dock_send(0, 0)
+                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw))
+                return True
         if tag and tag.get("stage_dist_m") is not None:
             sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
             # ★ run 5 log: with the staging point only ~0.4 m away its bearing swung ±80° every tick and the
@@ -1781,9 +1858,15 @@ async def _dock_stage_back():
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
         tol = DOCK["center_tol"] * (0.6 if near else 1.0)   # tighter as the stand gets close
-        if abs(x_err) > DOCK["turn_only"] and not near:
-            linear = 0.0; _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
+        if abs(x_err) > 0.30:
+            # big error: one alignment pulse, then look again (never a continuous spin)
+            _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
+            await _dock_pulse_turn(learner.sign() * x_err, "rear")
+            learner.observe(x_err, True)
+            _dock_log_tick("back", "pulse")
+            continue
         else:
+            angular = max(-0.25, min(0.25, angular))
             if abs(x_err) < tol:
                 angular = 0.0
             linear = -(DOCK["rev_near"] if near else DOCK["rev"])
@@ -2230,7 +2313,7 @@ async def dock_post(request: Request):
         return {"ok": True, "seat": seat}
     if action == "test":
         # one frame from each camera, no motion — what the docker sees right now
-        out = {"front": None, "rear": None, "mirror": _dock["mirror"], "heading": _dock_heading()}
+        out = {"front": None, "rear": None, "mirror": _dock["mirror"], "heading": _dock_heading(), "native": await _dock_native_dims()}
         for cam in ("front", "rear"):
             try:
                 if cam == "rear" and not await browser_service.has_rear_camera():
