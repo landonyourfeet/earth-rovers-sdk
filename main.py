@@ -48,7 +48,11 @@ async def lifespan(app: FastAPI):
         timeout=aiohttp.ClientTimeout(total=15)
     )
     warmup_task = asyncio.create_task(warmup_browser_when_ready())
+    odo_task = asyncio.create_task(_odo_ticker())   # ★ OKCREAL: dead-reckoning integrator for RETURN TO DOCK
     yield
+    odo_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await odo_task
     warmup_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await warmup_task
@@ -943,6 +947,9 @@ async def control(request: Request):
     #   aborts self-docking — the human always wins.
     if _dock_active() and (_command_is_moving(command) or body.get("dock") == "stop"):
         await _dock_cancel("manual control")
+    if _return_active() and (_command_is_moving(command) or body.get("dock") == "stop"):
+        await _return_cancel("manual control")
+    _odo_note(command)
     # Arm BEFORE dispatch: if the send times out ambiguously the rover may
     # still have received the motion command — the watchdog must cover it.
     arm_control_watchdog(command)
@@ -1396,6 +1403,7 @@ async def _dock_send(linear: float, angular: float):
     arm_control_watchdog(cmd)
     _dock["cmds"] += 1
     _dock["_last_cmd"] = (cmd["linear"], cmd["angular"])
+    _odo_note(cmd)
     try:
         await _dispatch_browser_control(cmd)
     except Exception as e:
@@ -1725,7 +1733,7 @@ async def _dock_final(z_from: float):
         b = _dock_battery()
         _dock_log_tick("contact", "bat %s->%s" % (b0, b))
         if b0 is not None and b is not None and b >= b0 + 1:
-            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); return True
+            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); _odo_set_home("self-dock charging"); return True
         if b0 is not None and b is not None and b0 >= 99:
             _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
         if time.time() - tw > DOCK["charge_wait_s"]:
@@ -1735,6 +1743,241 @@ async def _dock_final(z_from: float):
                 await _dock_send(-DOCK["rev_final"], 0.0); await asyncio.sleep(DOCK["nudge_s"]); await _dock_send(0, 0)
                 tw = time.time(); b0 = _dock_battery(); continue
             _dock["state"] = "docked_nocharge"; _dock_set("no_charge", "on the stand but the battery is not rising - check the pads"); return False
+
+
+# ★ OKCREAL (Sep 5, 2026 — Cap: "how we make the system automatically return to
+#   this docking position… the rooms will change on every listing; the one thing
+#   that stays the same is the dock — we power the rover on the first time already
+#   on the dock"). RETURN TO DOCK = dead-reckoned breadcrumbs + the vision docker.
+#   HOME is the dock: set when the rover is placed (SET HOME), when a self-dock
+#   succeeds, or by Connect when it sees the battery charging. From then on every
+#   drive command is integrated (commanded speed × time along the compass heading)
+#   into a position relative to home, and a breadcrumb is dropped every
+#   ODO_CRUMB_M along the way; loops in the trail are cut. RETURN walks the
+#   crumbs back in reverse — the path it already drove, so doorways and furniture
+#   are handled by the human who drove out — and when it is within
+#   RETURN_HANDOFF_M of home, or either camera sees the dock, it hands off to the
+#   self-docker. Dead reckoning drifts; the handoff distance covers that.
+ODO = {
+    "mps_per_unit": float(os.getenv("ODO_MPS_PER_UNIT", "1.1")),   # linear 1.0 ≈ 4 km/h (Frodobots spec)
+    "crumb_m": float(os.getenv("ODO_CRUMB_M", "0.4")),
+    "loop_cut_m": float(os.getenv("ODO_LOOP_CUT_M", "0.6")),
+    "handoff_m": float(os.getenv("RETURN_HANDOFF_M", "2.5")),
+    "reach_m": float(os.getenv("RETURN_REACH_M", "0.35")),
+    "drive": float(os.getenv("RETURN_DRIVE", "0.18")),
+    "turn": float(os.getenv("RETURN_TURN", "0.5")),
+    "turn_only_deg": float(os.getenv("RETURN_TURN_ONLY_DEG", "28")),
+    "crumb_timeout_s": float(os.getenv("RETURN_CRUMB_TIMEOUT_S", "25")),
+    "timeout_s": float(os.getenv("RETURN_TIMEOUT_S", "480")),
+    "look_every_s": float(os.getenv("RETURN_LOOK_EVERY_S", "4")),
+}
+_odo = {"home_set": False, "home_hdg": None, "x": 0.0, "y": 0.0, "crumbs": [], "last_cmd": (0.0, 0.0), "last_t": None, "dist_total": 0.0, "home_at": None}
+_ret = {"task": None, "state": "idle", "phase": None, "reason": None, "since": None, "started_at": None, "target_i": None, "dist_home": None}
+
+
+def _odo_pos():
+    return {"x": round(_odo["x"], 2), "y": round(_odo["y"], 2), "dist_home": round(math.hypot(_odo["x"], _odo["y"]), 2), "crumbs": len(_odo["crumbs"]), "home_set": _odo["home_set"], "home_hdg": _odo["home_hdg"], "trail_m": round(_odo["dist_total"], 1)}
+
+
+def _odo_integrate(now=None):
+    """Advance position by the last command over the elapsed time (dead-man capped)."""
+    now = now or time.time()
+    lt = _odo["last_t"]
+    if lt is None:
+        _odo["last_t"] = now; return
+    dt = min(max(0.0, now - lt), 1.0)
+    _odo["last_t"] = now
+    lin = _odo["last_cmd"][0]
+    if not lin or not _odo["home_set"]:
+        return
+    h = _dock_heading()
+    if h is None:
+        return
+    d = lin * ODO["mps_per_unit"] * dt
+    _odo["x"] += d * math.sin(math.radians(h)); _odo["y"] += d * math.cos(math.radians(h))
+    _odo["dist_total"] += abs(d)
+    cr = _odo["crumbs"]
+    if not cr or math.hypot(_odo["x"] - cr[-1][0], _odo["y"] - cr[-1][1]) >= ODO["crumb_m"]:
+        # loop cut: if we are back near an earlier crumb, drop everything after it
+        for i in range(len(cr) - 3, -1, -1):
+            if math.hypot(_odo["x"] - cr[i][0], _odo["y"] - cr[i][1]) < ODO["loop_cut_m"]:
+                del cr[i + 1:]; break
+        cr.append((round(_odo["x"], 3), round(_odo["y"], 3), h))
+        if len(cr) > 4000:
+            del cr[0:len(cr) - 4000]
+
+
+def _odo_note(cmd):
+    try:
+        _odo_integrate()
+        _odo["last_cmd"] = (float(cmd.get("linear") or 0.0), float(cmd.get("angular") or 0.0))
+    except Exception:
+        pass
+
+
+def _odo_set_home(reason: str):
+    _odo.update({"home_set": True, "home_hdg": _dock_heading(), "x": 0.0, "y": 0.0, "crumbs": [], "last_cmd": (0.0, 0.0), "last_t": time.time(), "dist_total": 0.0, "home_at": time.time()})
+    logger.info("odo: HOME set (%s) heading=%s", reason, _odo["home_hdg"])
+
+
+async def _odo_ticker():
+    while True:
+        try:
+            _odo_integrate()
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+
+def _return_active():
+    t = _ret["task"]; return bool(t and not t.done())
+
+
+async def _return_cancel(reason):
+    t = _ret["task"]
+    if t and not t.done():
+        _ret["reason"] = reason; t.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await t
+
+
+def _ret_set(phase, reason=None):
+    if _ret["phase"] != phase:
+        _ret["phase"] = phase; _ret["since"] = time.time(); logger.info("return: %s%s", phase, (" — " + reason) if reason else "")
+        _docklog_event("return", phase + ((" — " + reason) if reason else ""), {"pos": _odo_pos()})
+    if reason:
+        _ret["reason"] = reason
+
+
+async def _return_dock_visible():
+    """Settled look with both cameras: is the dock in view?"""
+    for cam in ("front", "rear"):
+        try:
+            if cam == "rear" and not await browser_service.has_rear_camera():
+                continue
+            see = await _dock_settled_look(cam)
+            tag = see and see.get("tag"); sheet = see and see.get("sheet")
+            if tag or (sheet and sheet["ratio"] >= DOCK["sheet_confirm"]):
+                return cam
+        except Exception:
+            pass
+    return None
+
+
+async def _return_loop():
+    _ret.update({"state": "returning", "started_at": time.time(), "reason": None, "phase": None})
+    _docklog_reset(); _docklog_event("start", "return to dock started", {"pos": _odo_pos()})
+    try:
+        if not _odo["home_set"]:
+            _ret["state"] = "failed"; _ret_set("no_home", "HOME is not set — dock the rover once (or press SET HOME while docked)"); return
+        crumbs = list(_odo["crumbs"]); crumbs.append((0.0, 0.0, _odo["home_hdg"]))   # …and finally home itself
+        # walk the trail backwards, skipping crumbs we are already past
+        targets = list(reversed(crumbs))
+        spin_sign = _dock["sign"]["spin"]; last_look = 0.0; i = 0
+        while i < len(targets):
+            if time.time() - _ret["started_at"] > ODO["timeout_s"]:
+                await _dock_send(0, 0); _ret["state"] = "failed"; _ret_set("timeout", "gave up after %ds" % ODO["timeout_s"]); return
+            tx, ty, _ = targets[i]; _ret["target_i"] = i
+            dist_home = math.hypot(_odo["x"], _odo["y"]); _ret["dist_home"] = round(dist_home, 2)
+            # hand-off checks: close to home, or the dock is in view
+            if dist_home <= ODO["handoff_m"]:
+                await _dock_send(0, 0); _ret_set("handoff", "within %.1f m of home — vision docking takes over" % dist_home); break
+            if time.time() - last_look > ODO["look_every_s"]:
+                last_look = time.time()
+                cam = await _return_dock_visible()
+                if cam:
+                    _ret_set("handoff", "the %s camera can see the dock — vision docking takes over" % cam); break
+            # skip crumbs that are farther from home than we are (already passed) except the last few
+            if i < len(targets) - 2 and math.hypot(tx, ty) > dist_home + ODO["crumb_m"]:
+                i += 1; continue
+            t_crumb = time.time()
+            while True:
+                dx = tx - _odo["x"]; dy = ty - _odo["y"]; d = math.hypot(dx, dy)
+                if d <= ODO["reach_m"]:
+                    break
+                if time.time() - t_crumb > ODO["crumb_timeout_s"]:
+                    _docklog_event("return", "crumb %d timed out at %.1f m — skipping" % (i, d)); break
+                h = _dock_heading()
+                if h is None:
+                    await _dock_send(0, 0); _ret_set("wait", "no compass heading"); await asyncio.sleep(0.5); continue
+                bearing = math.degrees(math.atan2(dx, dy)) % 360.0
+                rel = ((bearing - h + 540.0) % 360.0) - 180.0
+                if abs(rel) > ODO["turn_only_deg"]:
+                    await _dock_send(0, ODO["turn"] * spin_sign * (-1 if rel < 0 else 1))
+                    _ret_set("turn", "crumb %d/%d · %.1f m · turn %+d°" % (i, len(targets) - 1, d, rel))
+                else:
+                    ang = max(-0.35, min(0.35, spin_sign * rel / 40.0)) if abs(rel) > 6 else 0.0
+                    await _dock_send(ODO["drive"], ang)
+                    _ret_set("drive", "crumb %d/%d · %.1f m · home %.1f m" % (i, len(targets) - 1, d, math.hypot(_odo["x"], _odo["y"])))
+                _dock_log_tick("return", "crumb %d d=%.2f rel=%+d" % (i, d, rel))
+                await asyncio.sleep(0.25)
+                # learn the spin sign from the first in-place turn: if |rel| grows, flip
+                if abs(rel) > ODO["turn_only_deg"]:
+                    await asyncio.sleep(0.6); h2 = _dock_heading()
+                    if h2 is not None:
+                        rel2 = ((bearing - h2 + 540.0) % 360.0) - 180.0
+                        if abs(rel2) > abs(rel) + 3:
+                            spin_sign *= -1; _dock["sign"]["spin"] = spin_sign; _docklog_event("sign_flip", "return spin sign → %+d" % int(spin_sign))
+            i += 1
+        await _dock_send(0, 0)
+        _ret["state"] = "docking"; _ret_set("docking", "starting vision self-dock")
+        await _dock_loop()
+        _ret["state"] = "docked" if _dock["state"] == "docked" else ("failed" if _dock["state"] in ("failed", "docked_nocharge") else _dock["state"])
+        _ret_set("done", "self-dock ended: " + str(_dock["state"]) + (" — " + str(_dock["reason"]) if _dock.get("reason") else ""))
+        if _dock["state"] == "docked":
+            _odo_set_home("docked after return")
+    except asyncio.CancelledError:
+        try:
+            await _dock_send(0, 0)
+        finally:
+            _ret["state"] = "aborted"; _ret_set("aborted", _ret.get("reason") or "cancelled")
+        raise
+    except Exception as e:
+        logger.error("return: loop error: %s", e)
+        try:
+            await _dock_send(0, 0)
+        except Exception:
+            pass
+        _ret["state"] = "failed"; _ret_set("error", str(e)[:120])
+
+
+def _return_status():
+    return {"active": _return_active(), "state": _ret["state"], "phase": _ret["phase"], "reason": _ret["reason"], "dist_home": _ret["dist_home"],
+            "elapsed_s": (round(time.time() - _ret["started_at"], 1) if _ret["started_at"] else None), "odo": _odo_pos()}
+
+
+@app.get("/home")
+async def home_get():
+    return {"odo": _odo_pos(), "return": _return_status()}
+
+
+@app.post("/home")
+async def home_post(request: Request):
+    body = await request.json()
+    action = (body or {}).get("action", "set")
+    if action == "set":
+        _odo_set_home(str((body or {}).get("reason") or "manual"))
+        return {"ok": True, "odo": _odo_pos()}
+    if action == "clear":
+        _odo.update({"home_set": False, "crumbs": [], "x": 0.0, "y": 0.0}); return {"ok": True}
+    raise HTTPException(status_code=400, detail="action must be set|clear")
+
+
+@app.post("/return")
+async def return_post(request: Request):
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    body = await request.json()
+    action = (body or {}).get("action", "start")
+    if action == "stop":
+        await _return_cancel("stopped by operator"); await _dock_cancel("stopped by operator")
+        return _return_status()
+    if _return_active() or _dock_active():
+        return _return_status()
+    _ret["task"] = asyncio.create_task(_return_loop())
+    await asyncio.sleep(0.05)
+    return _return_status()
 
 
 async def _dock_loop():
@@ -1821,7 +2064,7 @@ def _dock_progress():
 
 
 def _dock_status():
-    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
+    return {"return": _return_status(), "odo": _odo_pos(), "active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
             "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
             "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
             "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
