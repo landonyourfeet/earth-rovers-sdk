@@ -1148,7 +1148,9 @@ DOCK = {
     "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "76")),   # run 14: rear read 0.32 m where the front had just staged at 0.69 m → same ~76° lens
     "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
-    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
+    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "8")),         # ★ Cap (run 18): only turn around when STRAIGHT ON with the tag
+    "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
+    "axis_align_max": int(os.getenv("DOCK_AXIS_ALIGN_MAX", "6")),
     # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
     #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
     #   ~25 cm from the stand, so the 180 happened ON the mat. The letter sheet is 12.6% wide at the 0.6 m staging
@@ -1433,7 +1435,7 @@ def dock_seat(jpeg: bytes):
         if bars and len(stripes) >= 2:
             bar = max(bars, key=lambda b: b["w"])
             left = min(stripes, key=lambda b: b["cx"]); right = max(stripes, key=lambda b: b["cx"])
-            if right["cx"] - left["cx"] > 0.3:
+            if right["cx"] - left["cx"] > 0.45 and abs(bar["cx"] - 0.5) < 0.3 and left["cx"] < bar["cx"] < right["cx"]:
                 return {"v": 2, "cx": round(bar["cx"] - 0.5, 3), "width": round(right["cx"] - left["cx"], 3), "bottom_y": round(bar["cy"], 3)}
     # --- v1 fallback: the tag's black square
     cs, _ = cv2.findContours(cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1457,6 +1459,22 @@ async def _dock_native_dims():
             return out; }"""), retry_on_disconnect=False)
     except Exception as e:
         return {"error": str(e)[:80]}
+
+
+def dock_led_green(jpeg: bytes):
+    """★ The INIU stand's charge LED is a bright green bar low on its front face. At the seat the rear
+    camera looks straight at the stand, so the LED may sit in the bottom of the frame. Returns the green
+    pixel fraction in the bottom third (0..1); ≥0.004 with a saturated blob is 'lit'."""
+    img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]; band = img[int(h * 0.66):, :]
+    hsv = cv2.cvtColor(band, cv2.COLOR_BGR2HSV)
+    m = cv2.inRange(hsv, (40, 110, 150), (85, 255, 255))
+    frac = float(m.mean() / 255.0)
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    biggest = max((cv2.contourArea(c) for c in cs), default=0) / float(band.shape[0] * band.shape[1])
+    return {"frac": round(frac, 4), "blob": round(biggest, 4), "lit": bool(biggest >= 0.002)}
 
 
 def _dock_rpms_zero() -> bool:
@@ -1606,6 +1624,48 @@ async def _dock_pulse_turn(direction: float, cam: str):
     return await _dock_settled_look(cam)
 
 
+async def _dock_axis_crab(learner, y0):
+    """★ Cap (run 18, rover placed 45° off the dock): "it approached too close when not straight on, then
+    tried the turn. It should only turn when directly straight on with the tag." A differential rover
+    gets onto the dock's axis the way a driver does: turn ~35° to one side, drive a short leg, turn back
+    to face the tag, look at the tag's yaw again. If the yaw shrank, keep crabbing that way; if it grew,
+    the other way. Needs no sign conventions - only whether the number got smaller."""
+    side = _dock.get("_crab_side") or (1 if y0 > 0 else -1)
+    # 1. turn to put the tag ~35% to the side of the frame
+    for _ in range(6):
+        see = await _dock_pulse_turn(side, "front"); tag = see and see.get("tag")
+        _dock_log_tick("crab", "turn-out")
+        if not tag or abs(tag["x_err"]) >= 0.30:
+            break
+    # 2. short leg forward
+    await _dock_send(DOCK["fwd_near"], 0.0); await asyncio.sleep(0.35 / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+    _dock_log_tick("crab", "leg")
+    # 3. turn back until the tag is centered
+    tag = None
+    for _ in range(10):
+        see = await _dock_settled_look("front"); tag = see and see.get("tag")
+        _dock_log_tick("crab", "turn-back x_err=%s" % (tag and tag["x_err"]))
+        if not tag:
+            await _dock_pulse_turn(-side, "front"); continue
+        if abs(tag["x_err"]) < 0.08:
+            break
+        await _dock_pulse_turn(learner.sign() * tag["x_err"], "front")
+    # 4. did the yaw shrink?
+    ys = []
+    for _ in range(3):
+        see = await _dock_settled_look("front"); tag = see and see.get("tag")
+        if tag and tag.get("yaw_deg") is not None:
+            ys.append(tag["yaw_deg"])
+    y1 = sorted(ys)[len(ys) // 2] if ys else y0
+    if abs(y1) > abs(y0) - 2:
+        side *= -1
+        _docklog_event("crab", "yaw %+d° → %+d°: wrong side, switching" % (y0, y1))
+    else:
+        _docklog_event("crab", "yaw %+d° → %+d°: on the right side" % (y0, y1))
+    _dock["_crab_side"] = side
+    return y1
+
+
 async def _dock_offaxis_fix(learner):
     """★ run 9 log: after the 180 the rover sat 33 cm beside the dock axis at 0.66 m. Pulling straight
     forward and re-approaching reproduced the same geometry three times. This is the manoeuvre a
@@ -1749,7 +1809,17 @@ async def _dock_stage_approach():
         # ---- with a pose ----
         if tag and tag.get("z_m") is not None:
             z = tag["z_m"]; yaw = tag.get("yaw_deg", 0.0); x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
-            far_offaxis = z > 1.5 and abs(lat) > 0.20 and tag.get("stage_dist_m") is not None
+            far_offaxis = False   # the staging-point chase is retired; the crab manoeuvre below handles off-axis
+            # yaw glitch filter: median of the last three readings
+            yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-3]
+            yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
+            if z > 0.9 and abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
+                _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
+                await _dock_send(0, 0)
+                _dock_set("axis", "getting onto the dock axis · yaw %+d° · crab %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
+                await _dock_axis_crab(learner, yaw_med)
+                _dock["_yaw_hist"] = []
+                continue
             if not far_offaxis:
                 # ★ run 8 log: at 1.0 m, centered, it spun 90° chasing a staging point 40 cm away. When the tag
                 #   is in front of us the plan is simple: pulse to center it, then drive straight until DOCK_STAGE_M.
@@ -1767,8 +1837,15 @@ async def _dock_stage_approach():
                     await _dock_send(lin, ang)
                     _dock_log_tick("approach")
                     await asyncio.sleep(1.0 / DOCK["hz"]); continue
+                if abs(yaw_med) > DOCK["yaw_ok_deg"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    # close, centered, but not straight on: back off a leg and crab once more
+                    _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
+                    _dock_set("axis", "at staging distance but %+d° off axis - backing off to square up" % yaw_med)
+                    await _dock_send(-DOCK["fwd_near"], 0.0); await asyncio.sleep(0.6 / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                    await _dock_axis_crab(learner, yaw_med); _dock["_yaw_hist"] = []
+                    continue
                 await _dock_send(0, 0)
-                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw))
+                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
                 return True
         if tag and tag.get("stage_dist_m") is not None:
             sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
@@ -1997,12 +2074,20 @@ def _dock_battery():
         return None
 
 
+def linear_cmd_reverse(cmd):
+    try:
+        return bool(cmd) and float(cmd[0]) < 0
+    except Exception:
+        return False
+
+
 async def _dock_final(z_from: float):
     """Sep 5 (Cap: "rolling back very slowly until it receives charge - that's when it
     knows it's arrived"). The tag is gone from the rear frame because we are inside
     its field of view; roll straight back at DOCK_REV_FINAL until the wheels stall or
     the cap, then hold and watch the battery. Rising battery = docked and charging.
     No rise after DOCK_CHARGE_WAIT_S -> one more push, wait again, then report."""
+    _dock["_seat_hist"] = []
     _dock_set("final", "tag out of view at %.2f m - seating on the coil by frame geometry" % z_from)
     ref = _dock.get("seat_ref") or {}
     t0 = time.time(); stalled = False; seated = None; tw0 = ref.get("width", DOCK["seat_width"]); tol = DOCK["seat_width_tol"]; cx0 = ref.get("cx", DOCK["seat_cx"])
@@ -2033,6 +2118,13 @@ async def _dock_final(z_from: float):
             await _dock_send(-DOCK["rev_final"], 0.0); moving_cmd = True; _dock_set("final", "rolling back - waiting for the sheet to fill the frame")
         _dock_log_tick("final", "seat=%s" % (seat,))
         await asyncio.sleep(1.0 / DOCK["hz"])
+        # ★ run 17: it sat against the stand for 20 s with the marks frozen (width 0.75 ±0.01) and wheels
+        #   slipping on the mat, so the rpm stall never fired and only the timeout ended it. Frozen marks
+        #   under a reverse command = we are against the stand.
+        if seat and moving_cmd and linear_cmd_reverse(_dock.get("_last_cmd")):
+            hist = _dock.setdefault("_seat_hist", []); hist.append((time.time(), seat["width"])); del hist[:-15]
+            if len(hist) >= 12 and hist[-1][0] - hist[0][0] >= 2.5 and max(x[1] for x in hist) - min(x[1] for x in hist) <= 0.03 and abs(seat["cx"] - cx0) <= 0.06:
+                stalled = True; seated = seat; break
         if moving_cmd and time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero():
             stall_n = getattr(_dock_final, "_stall_n", 0) + 1; _dock_final._stall_n = stall_n
             if stall_n >= 4:          # ~0.8 s of zero rpm under a real reverse command = against the stand
@@ -2048,13 +2140,29 @@ async def _dock_final(z_from: float):
     #   a flag) that reacts the instant the coil couples. If one exists, it becomes the detector.
     _docklog_event("raw_telemetry", "at contact", {"raw": telemetry_hub.latest})
     last_raw = time.time()
+    rise_n = 0
     while True:
         await asyncio.sleep(3.0)
         b = _dock_battery()
-        _dock_log_tick("contact", "bat %s->%s" % (b0, b))
+        led = None
+        try:
+            fr = await _dock_frame("rear"); led = dock_led_green(fr.jpeg) if fr else None
+        except Exception:
+            led = None
+        _dock["sense"] = {"cam": "rear", "led": led}
+        _dock_log_tick("contact", "bat %s->%s led=%s" % (b0, b, led))
+        if led and led["lit"]:
+            _dock["state"] = "docked"; _dock_set("docked", "stand LED is green - charging (battery %s%%)" % b); return True
+        # a one-sample flicker (78/79/80 during the seat) is not a rise: need it twice
+        if b0 is not None and b is not None and b >= b0 + 1:
+            rise_n += 1
+            if rise_n < 2:
+                continue
+        else:
+            rise_n = 0
         if time.time() - last_raw >= 10:
             last_raw = time.time(); _docklog_event("raw_telemetry", "+%ds after contact" % int(time.time() - tw), {"raw": telemetry_hub.latest})
-        if b0 is not None and b is not None and b >= b0 + 1:
+        if b0 is not None and b is not None and b >= b0 + 1 and rise_n >= 2:
             _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); _odo_set_home("self-dock charging"); return True
         if b0 is not None and b is not None and b0 >= 99:
             _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
@@ -2310,7 +2418,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": []})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
