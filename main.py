@@ -1096,6 +1096,14 @@ DOCK = {
     "min_ratio": float(os.getenv("DOCK_MIN_RATIO", "0.008")),
     "lane_half": float(os.getenv("DOCK_LANE_HALF", "0.33")),
     "sheet_floor_y": float(os.getenv("DOCK_SHEET_FLOOR_Y", "0.70")),   # small blobs below this line are floor clutter, not the sheet
+    "sheet_ceiling_y": float(os.getenv("DOCK_SHEET_CEILING_Y", "0.18")),   # blobs above this line are lights, not the sheet
+    # final approach (Cap: "rolling back very slowly until it receives charge - that's when it knows it's arrived")
+    "final_z_m": float(os.getenv("DOCK_FINAL_Z_M", "0.32")),        # tag lost inside this range -> blind final roll
+    "rev_final": float(os.getenv("DOCK_REV_FINAL", "0.07")),
+    "final_max_s": float(os.getenv("DOCK_FINAL_MAX_S", "10")),      # blind roll cap
+    "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "240")), # how long to wait for the battery to start rising
+    "nudge_s": float(os.getenv("DOCK_NUDGE_S", "0.8")),             # extra push if no charge after the wait
+    "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
     "fwd": float(os.getenv("DOCK_FWD", "0.16")), "fwd_near": float(os.getenv("DOCK_FWD_NEAR", "0.10")),
     "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
     "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
@@ -1311,9 +1319,19 @@ def dock_see(jpeg: bytes, cam: str):
         cy = (y + bh / 2.0) / h
         if cy > DOCK["sheet_floor_y"] and bw / float(w) < 0.3:
             continue
+        # Sep 5 flight log: purple LED strip lighting along the ceiling read as "sheet 37%"
+        # and sent the rover backing toward a lamp. The stand's sheet never sits in the top
+        # band of the frame, and once it's more than a few px wide it has the tag's black
+        # square inside it - a light strip has no dark interior.
+        if cy < DOCK["sheet_ceiling_y"] and bw / float(w) < 0.5:
+            continue
         roi = hsv[y:y + bh, x:x + bw]
         if (roi[..., 2] >= DOCK["sheet_val_min"]).mean() < 0.5 or np.median(roi[..., 1]) < DOCK["sheet_sat_min"]:
             continue
+        if bw >= 14:
+            dark = (roi[..., 2] < 90).mean()
+            if dark < 0.05 or dark > 0.65:
+                continue
         if best is None or bw * bh > best[2] * best[3]:
             best = (x, y, bw, bh)
     if best:
@@ -1547,7 +1565,7 @@ async def _dock_stage_turn():
 
 async def _dock_stage_back():
     """Rear cam (mirrored), reversing onto the mat until the wheels stall."""
-    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None
+    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None; last_close = None
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -1557,9 +1575,13 @@ async def _dock_stage_back():
         tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
         # steering reference, best first: tag pose (lateral offset + dock yaw) → tag bearing → sheet → rails
         if tag and tag.get("x_m") is not None and tag.get("z_m"):
-            # error = where the dock axis crosses our path: lateral offset plus the yaw we're carrying
-            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * 0.8))
+            # error = where the dock axis crosses our path: lateral offset, plus the yaw we're
+            # carrying - but only once the tag is big enough for the pose yaw to be stable
+            # (flight log: at 45 px it flip-flopped +-30 deg every tick and made the rover fishtail)
+            yaw_w = 0.8 if tag["side_px"] >= DOCK["yaw_min_px"] else 0.0
+            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * yaw_w))
             ref = "tag %.2fm lat %+.2f yaw %+d°" % (tag["z_m"], tag["x_m"], tag.get("yaw_deg", 0))
+            last_close = (tag["z_m"], tag["x_m"])
         elif tag:
             x_err = tag["x_err"]; ref = "tag %dpx" % tag["side_px"]
         elif sheet and sheet["ratio"] >= DOCK["min_ratio"]:
@@ -1568,6 +1590,9 @@ async def _dock_stage_back():
             x_err = lane; ref = "rails"
         else:
             x_err = None; ref = None
+        if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"] and abs(last_close[1]) <= 0.12:
+            # the tag just slid out of view while we were close and aligned - that IS the last stretch
+            return await _dock_final(last_close[0])
         if x_err is None:
             see = await _dock_settled_look("rear"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
             if tag and tag.get("x_m") is not None and tag.get("z_m"):
@@ -1614,6 +1639,48 @@ async def _dock_stage_back():
         await _dock_send(linear, angular)
         _dock_log_tick("back", ref)
         await asyncio.sleep(1.0 / DOCK["hz"])
+
+
+def _dock_battery():
+    try:
+        b = (telemetry_hub.latest or {}).get("battery")
+        return None if b is None else float(b)
+    except Exception:
+        return None
+
+
+async def _dock_final(z_from: float):
+    """Sep 5 (Cap: "rolling back very slowly until it receives charge - that's when it
+    knows it's arrived"). The tag is gone from the rear frame because we are inside
+    its field of view; roll straight back at DOCK_REV_FINAL until the wheels stall or
+    the cap, then hold and watch the battery. Rising battery = docked and charging.
+    No rise after DOCK_CHARGE_WAIT_S -> one more push, wait again, then report."""
+    _dock_set("final", "tag out of view at %.2f m - rolling back slowly to the pads" % z_from)
+    t0 = time.time(); stalled = False
+    while time.time() - t0 < DOCK["final_max_s"]:
+        await _dock_send(-DOCK["rev_final"], 0.0)
+        _dock_log_tick("final", "blind roll")
+        await asyncio.sleep(1.0 / DOCK["hz"])
+        if time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero():
+            stalled = True; break
+    await _dock_send(0, 0)
+    _dock_set("contact", "at the stand (%s) - watching for charge" % ("wheels stalled" if stalled else "rolled the full distance"))
+    b0 = _dock_battery(); tw = time.time(); nudged = False
+    while True:
+        await asyncio.sleep(3.0)
+        b = _dock_battery()
+        _dock_log_tick("contact", "bat %s->%s" % (b0, b))
+        if b0 is not None and b is not None and b >= b0 + 1:
+            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); return True
+        if b0 is not None and b is not None and b0 >= 99:
+            _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
+        if time.time() - tw > DOCK["charge_wait_s"]:
+            if not nudged:
+                nudged = True
+                _dock_set("nudge", "no charge after %ds - one more push" % DOCK["charge_wait_s"])
+                await _dock_send(-DOCK["rev_final"], 0.0); await asyncio.sleep(DOCK["nudge_s"]); await _dock_send(0, 0)
+                tw = time.time(); b0 = _dock_battery(); continue
+            _dock["state"] = "docked_nocharge"; _dock_set("no_charge", "on the stand but the battery is not rising - check the pads"); return False
 
 
 async def _dock_loop():
