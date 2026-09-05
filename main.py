@@ -94,6 +94,59 @@ app.mount("/static", StaticFiles(directory="./static"), name="static")
 browser_service = BrowserService()
 telemetry_hub = TelemetryHub()
 
+
+# ★ OKCREAL (Sep 5, 2026): rover microphone. PCM16 mono 16 kHz chunks arrive
+#   from the headless page over /ws/audio-ingest and fan out to every
+#   GET /audio-feed listener. The page tap is switched on when the first
+#   listener connects and off when the last one leaves, so the rover's SIM
+#   carries no extra load while nobody is listening (the mic is already in the
+#   Agora channel either way; this only adds server → listener traffic).
+class AudioHub:
+    def __init__(self):
+        self._clients: set[asyncio.Queue] = set()
+        self.ingest_connected = False
+        self.last_chunk_at: Optional[float] = None
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._clients.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._clients.discard(q)
+
+    @property
+    def listeners(self) -> int:
+        return len(self._clients)
+
+    def publish(self, chunk: bytes):
+        self.last_chunk_at = time.time()
+        for q in list(self._clients):
+            if q.full():
+                try:
+                    q.get_nowait()   # drop the oldest — a slow listener never builds a lag
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                q.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass
+
+
+audio_hub = AudioHub()
+_audio_tap_lock = asyncio.Lock()
+
+
+async def _audio_tap_sync():
+    """Switch the page tap to match whether anyone is listening."""
+    async with _audio_tap_lock:
+        want = audio_hub.listeners > 0
+        try:
+            result = await browser_service.audio_tap(want)
+            logger.info("audio tap %s: %s", "on" if want else "off", result)
+        except Exception as e:
+            logger.warning("audio tap %s failed: %s", "on" if want else "off", e)
+
 feed_broadcasters = {
     "front": FrameBroadcaster(browser_service.front_feed),
     "rear": FrameBroadcaster(browser_service.rear_feed),
@@ -952,12 +1005,76 @@ async def stop_live():
         raise HTTPException(status_code=500, detail=f"stop failed: {str(e)}") from e
 
 
+@app.websocket("/ws/audio-ingest")
+async def ws_audio_ingest(websocket: WebSocket):
+    # Private channel for the headless /sdk page; local connections only.
+    client_host = websocket.client.host if websocket.client else None
+    supplied_token = websocket.query_params.get("token", "")
+    if client_host not in ("127.0.0.1", "::1") or not hmac.compare_digest(
+        supplied_token, INGEST_TOKEN
+    ):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    audio_hub.ingest_connected = True
+    try:
+        while True:
+            chunk = await websocket.receive_bytes()
+            if chunk:
+                audio_hub.publish(chunk)
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        audio_hub.ingest_connected = False
+
+
+@app.get("/audio-feed")
+async def audio_feed():
+    """Rover microphone as a raw PCM stream: signed 16-bit LE, mono, 16 kHz."""
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    queue = audio_hub.subscribe()
+    asyncio.create_task(_audio_tap_sync())
+
+    async def stream():
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield b"\x00\x00"   # one silent sample keeps the connection alive while the tap is (re)arming (never an empty chunk)
+                    continue
+                yield chunk
+        finally:
+            audio_hub.unsubscribe(queue)
+            asyncio.create_task(_audio_tap_sync())
+
+    return StreamingResponse(
+        stream(),
+        media_type="application/octet-stream",
+        headers={"X-Audio-Format": "pcm_s16le;rate=16000;channels=1", "Cache-Control": "no-store"},
+    )
+
+
+@app.get("/audio-status")
+async def audio_status():
+    try:
+        page = await browser_service._run(lambda p: p.evaluate("() => window.audioTapStatus ? window.audioTapStatus() : null"), retry_on_disconnect=False)
+    except Exception:
+        page = None
+    return {"listeners": audio_hub.listeners, "ingest": audio_hub.ingest_connected, "last_chunk_age_s": (round(time.time() - audio_hub.last_chunk_at, 1) if audio_hub.last_chunk_at else None), "page": page}
+
+
 @app.get("/live-status")
 async def live_status():
     try:
         return await browser_service.live_status() or {"playing": False}
     except Exception:
         return {"playing": False}
+
+
+_speak_lock = asyncio.Lock()
 
 
 @app.post("/speak")
@@ -971,15 +1088,32 @@ async def speak(request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="Text not provided")
 
+    # ★ OKCREAL (Sep 5, 2026 — Cap: "when i push more than one voice command the
+    #   second one does not work"). Upstream wrote EVERY utterance to the same
+    #   file (static/tts_output.mp3) and handed the browser the same URL each
+    #   time, so a second command overwrote the file while the first was still
+    #   being fetched/played and the page's fetch could serve the cached first
+    #   clip. Fix: one unique file per utterance, commands queued one after
+    #   another (never two audio tracks published at once), file removed after
+    #   it has played.
+    fname = f"tts_{int(time.time()*1000)}_{secrets.token_hex(3)}"
+    audio_path = None
     try:
-        audio_path = await generate_speech(text, "static/tts_output")
+        audio_path = await generate_speech(text, f"static/{fname}")
         audio_filename = os.path.basename(audio_path)
-        audio_url = f"http://127.0.0.1:8000/static/{audio_filename}"
-        await browser_service.speak(audio_url)
+        audio_url = f"http://127.0.0.1:8000/static/{audio_filename}?v={secrets.token_hex(4)}"
+        async with _speak_lock:
+            await browser_service.speak(audio_url)
         return {"message": "Speech sent to rover"}
     except Exception as e:
         logger.error("Error in /speak: %s", str(e))
         raise HTTPException(status_code=500, detail=f"TTS failed: {str(e)}") from e
+    finally:
+        if audio_path:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
 
 
 @app.get("/screenshot")
