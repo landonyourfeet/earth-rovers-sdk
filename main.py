@@ -1105,6 +1105,13 @@ DOCK = {
     "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "240")), # how long to wait for the battery to start rising
     "nudge_s": float(os.getenv("DOCK_NUDGE_S", "0.8")),             # extra push if no charge after the wait
     "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
+    # ★ Sep 5 run 3 (console: "APPROACH · FRONT CAM · driving to the dock · sheet 1%" while the dock was
+    #   behind the rover): a sheet-only cue must PROVE itself — once it is DOCK_SHEET_CONFIRM wide the tag
+    #   should decode; if it doesn't within DOCK_SHEET_PROVE_S the blob is a purple light, not the dock,
+    #   and that bearing is ignored for DOCK_BLACKLIST_S.
+    "sheet_confirm": float(os.getenv("DOCK_SHEET_CONFIRM", "0.06")),
+    "sheet_prove_s": float(os.getenv("DOCK_SHEET_PROVE_S", "2.5")),
+    "blacklist_s": float(os.getenv("DOCK_BLACKLIST_S", "45")),
     "fwd": float(os.getenv("DOCK_FWD", "0.16")), "fwd_near": float(os.getenv("DOCK_FWD_NEAR", "0.10")),
     "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
     "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
@@ -1122,7 +1129,11 @@ DOCK = {
     "ang_min_moving": float(os.getenv("DOCK_ANG_MIN_MOVING", "0.15")),
     "spin_tol_deg": float(os.getenv("DOCK_SPIN_TOL_DEG", "8")), "spin_timeout_s": float(os.getenv("DOCK_SPIN_TIMEOUT_S", "25")),
     "spin_blind_s": float(os.getenv("DOCK_SPIN_BLIND_S", "3.5")),   # no heading data: timed turn
-    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.40")), "search_s": float(os.getenv("DOCK_SEARCH_S", "25")),
+    # ★ Sep 5 run 4 flight log: at 0.40 the search turned ~2°/s (25 s covered ~60°) — the dock was never
+    #   swept into view. Search is now spin-and-look by DEGREES: strong pulses until ≥380° of compass
+    #   has been covered (or DOCK_SEARCH_S as the ceiling), checking BOTH cameras each stop.
+    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.65")), "search_s": float(os.getenv("DOCK_SEARCH_S", "90")),
+    "search_pulse_s": float(os.getenv("DOCK_SEARCH_PULSE_S", "0.8")),
     "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
     # ★ Sep 5 (Cap: "it's trying to find the image while moving which causes blur"):
@@ -1173,6 +1184,10 @@ def _docklog_snap(label, jpeg):
     except Exception:
         pass
 
+_dock_blacklist = {"front": [], "rear": []}   # cam → [(x_err, until)]
+def _dock_blacklisted(cam, x_err):
+    now = time.time(); lst = [b for b in _dock_blacklist.get(cam, []) if b[1] > now]; _dock_blacklist[cam] = lst
+    return any(abs(x_err - b[0]) < 0.12 for b in lst)
 _dock = {"task": None, "state": "idle", "phase": None, "since": None, "reason": None, "sense": None,
          "started_at": None, "last_seen": None, "cmds": 0, "cam": None,
          "mirror": {"front": None, "rear": None}, "sign": {"front": DOCK["front_sign"], "rear": DOCK["rear_sign"], "spin": 1.0}}
@@ -1333,6 +1348,8 @@ def dock_see(jpeg: bytes, cam: str):
             dark = (roi[..., 2] < 90).mean()
             if dark < 0.05 or dark > 0.65:
                 continue
+        if _dock_blacklisted(cam, (x + bw / 2.0) / w - 0.5):
+            continue
         if best is None or bw * bh > best[2] * best[3]:
             best = (x, y, bw, bh)
     if best:
@@ -1433,6 +1450,31 @@ def _dock_log_tick(stage, note=None):
         _docklog_snap(want + " (" + str(cam) + ")", jpeg)
 
 
+async def _dock_search(primary_cam: str):
+    """Spin-and-look until either camera has the dock. Returns ('front'|'rear', see) or None.
+    Rotation is measured on the compass so a slow rover still completes the sweep."""
+    h0 = _dock_heading(); hp = h0; turned = 0.0; t0 = time.time()
+    cams = [primary_cam] + (["rear" if primary_cam == "front" else "front"] if await browser_service.has_rear_camera() else [])
+    _dock_set("search", "sweeping for the dock (both cameras)")
+    while time.time() - t0 < DOCK["search_s"] and turned < 380:
+        await _dock_send(0, DOCK["search_turn"])
+        await asyncio.sleep(DOCK["search_pulse_s"])
+        for cam in cams:
+            see = await _dock_settled_look(cam)
+            tag = see and see.get("tag"); sheet = see and see.get("sheet")
+            if tag or (sheet and sheet["ratio"] >= DOCK["min_ratio"] and not _dock_blacklisted(cam, sheet["x_err"])):
+                _docklog_event("search_hit", "%s camera has the dock after ~%d° (%s)" % (cam, turned, "tag" if tag else "sheet %d%%" % int(sheet["ratio"] * 100)))
+                return (cam, see)
+        h = _dock_heading()
+        if h is not None and hp is not None:
+            turned += abs(((h - hp + 540.0) % 360.0) - 180.0); hp = h
+        _dock_set("search", "sweeping · ~%d° covered · %ds" % (turned, time.time() - t0))
+        _dock_log_tick("search", "turned~%d" % turned)
+    await _dock_send(0, 0)
+    _docklog_event("search_miss", "full sweep (~%d°) with no dock in either camera" % turned)
+    return None
+
+
 class _SignLearner:
     """Flip the steering sign if the error keeps growing under correction."""
     def __init__(self, cam):
@@ -1458,7 +1500,7 @@ async def _dock_stage_approach():
     Returns True when it's time to turn around. Hard stops so it can never
     plough into the stand: sheet filling the frame, tag closer than the
     staging distance, or the tag too big when no pose is available."""
-    learner = _SignLearner("front"); search_dir = 1.0; faced_since = None
+    learner = _SignLearner("front"); search_dir = 1.0; faced_since = None; sheet_big_since = None
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -1473,23 +1515,42 @@ async def _dock_stage_approach():
             await _dock_send(0, 0); _dock_set("staged", "inside staging distance (%.2f m) — turning" % tag["z_m"]); return True
         if tag and tag.get("z_m") is None and tag["side_px"] >= DOCK["tag_turn_px"]:
             await _dock_send(0, 0); _dock_set("staged", "tag %dpx (no pose) — turning" % tag["side_px"]); return True
+        # a sheet that is big enough to carry a readable tag but never decodes is a light, not the dock
+        if tag:
+            sheet_big_since = None
+        elif sheet and sheet["ratio"] >= DOCK["sheet_confirm"]:
+            sheet_big_since = sheet_big_since or now
+            if now - sheet_big_since > DOCK["sheet_prove_s"]:
+                _dock_blacklist["front"].append((sheet["x_err"], now + DOCK["blacklist_s"]))
+                _docklog_event("false_sheet", "front: sheet %d%% at %+d%% never showed a tag — ignoring that bearing" % (int(sheet["ratio"] * 100), int(sheet["x_err"] * 100)))
+                sheet = None; sheet_big_since = None
+        else:
+            sheet_big_since = None
         tgt = tag or sheet
         if not tgt:
             # a moving frame said nothing — stop and look before believing it
-            see = await _dock_settled_look("front"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); tgt = tag or sheet
+            see = await _dock_settled_look("front"); tag = see and see.get("tag"); sheet = see and see.get("sheet") if not (see and see.get("sheet") and _dock_blacklisted("front", see["sheet"]["x_err"])) else None; tgt = tag or sheet
         if not tgt:
-            if _dock["last_seen"] is None:
-                _dock["last_seen"] = now
-            lost = now - _dock["last_seen"]
-            if lost < 1.0:
-                _dock_set("lost", "dock not in view (front)")
-            elif lost < 1.0 + DOCK["search_s"]:
-                _dock_set("search", "turning to find the dock"); await _dock_send(0, DOCK["search_turn"] * search_dir); await asyncio.sleep(DOCK["pulse_s"])
-            else:
-                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return False
+            # look BEHIND first: if the rear camera already has the dock we are facing away — skip the approach and turn
+            try:
+                if await browser_service.has_rear_camera():
+                    rs = await _dock_settled_look("rear"); rt = rs and rs.get("tag"); rsh = rs and rs.get("sheet")
+                    _docklog_event("rear_look", "rear camera: %s" % ("TAG" if rt else ("sheet %d%%" % int(rsh["ratio"] * 100) if rsh else "nothing")))
+                    if rt or (rsh and rsh["ratio"] >= DOCK["sheet_confirm"] and not _dock_blacklisted("rear", rsh["x_err"])):
+                        _dock["cam"] = "rear"; _dock_set("rear_first", "dock is behind us already — skipping the approach and turn"); return "back"
+                    _dock["cam"] = "front"
+            except Exception:
+                pass
+        if not tgt:
+            _dock_set("lost", "dock not in view — sweeping")
+            hit = await _dock_search("front")
+            if not hit:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "swept a full circle and never saw the dock"); return False
+            cam, see = hit
+            if cam == "rear":
+                _dock["cam"] = "rear"; _dock_set("rear_first", "dock found behind us — skipping the approach and turn"); return "back"
             faced_since = None
-            _dock_log_tick("approach", "lost/search")
-            await asyncio.sleep(1.0 / DOCK["hz"]); continue
+            continue
         _dock["last_seen"] = now
         # ---- with a pose: navigate to the staging point, then square up ----
         if tag and tag.get("stage_dist_m") is not None:
@@ -1605,23 +1666,15 @@ async def _dock_stage_back():
             elif lane is not None:
                 x_err = lane; ref = "rails (settled)"
         if x_err is None:
-            if _dock["last_seen"] is None:
-                _dock["last_seen"] = now
-            lost = now - _dock["last_seen"]
-            if lost < 1.0:
-                _dock_set("lost", "dock not in view (rear)")
-            elif lost < 1.0 + DOCK["search_s"]:
-                # is the dock in FRONT of us? then the turn didn't take — go around again
-                if int(lost * 2) % 4 == 0:
-                    ffr = await _dock_frame("front"); fsee = dock_see(ffr.jpeg, "front") if ffr else None
-                    if fsee and (fsee.get("tag") or (fsee.get("sheet") and fsee["sheet"]["ratio"] >= 0.03)):
-                        await _dock_send(0, 0); _dock_set("turn_again", "dock is in front of us — turning around again"); return "turn"
-                _dock_set("search", "turning to find the dock (rear)"); await _dock_send(0, DOCK["search_turn"] * search_dir); await asyncio.sleep(DOCK["pulse_s"])
-            else:
-                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "lost the dock while backing in"); return False
+            _dock_set("lost", "dock not in view (rear) — sweeping")
+            hit = await _dock_search("rear")
+            if not hit:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "lost the dock while backing in and a full sweep found nothing"); return False
+            cam, see = hit
+            if cam == "front":
+                _dock_set("turn_again", "dock is in front of us — turning around again"); return "turn"
             rev_since = None
-            _dock_log_tick("back", "lost/search")
-            await asyncio.sleep(1.0 / DOCK["hz"]); continue
+            continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
@@ -1692,13 +1745,16 @@ async def _dock_loop():
     try:
         if not await browser_service.has_rear_camera():
             _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
-        if not await _dock_stage_approach():
+        ap = await _dock_stage_approach()
+        if not ap:
             return
         _dock["last_seen"] = None
         for attempt in range(3):
-            if not await _dock_stage_turn():
-                return
-            _dock["last_seen"] = None
+            if ap != "back":
+                if not await _dock_stage_turn():
+                    return
+                _dock["last_seen"] = None
+            ap = True
             r = await _dock_stage_back()
             if r != "turn":
                 return
