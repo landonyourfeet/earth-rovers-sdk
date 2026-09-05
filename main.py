@@ -1409,6 +1409,12 @@ def dock_see(jpeg: bytes, cam: str):
             out["rails"] = r["rails"]; out["lane_err"] = r["lane_err"]
     except Exception:
         pass
+    # runway lines (front camera): the trustworthy yaw at distance
+    try:
+        if cam == "front":
+            out["runway"] = dock_runway(jpeg, cam)
+    except Exception:
+        out["runway"] = None
     return out
 
 
@@ -1465,6 +1471,71 @@ async def _dock_native_dims():
             return out; }"""), retry_on_disconnect=False)
     except Exception as e:
         return {"error": str(e)[:80]}
+
+
+def dock_runway(jpeg: bytes, cam: str = "front"):
+    """★ Runway v2 (Cap printed it, Sep 5 evening): a solid black centerline and two black edge lines.
+    From the low front camera those lines converge on a vanishing point whose x position IS the
+    rover's yaw relative to the mat axis (a lane-keeping cue, no tag pose needed), and the
+    centerline's position at the bottom of the frame gives the lateral offset. Returns None when
+    fewer than two converging lines are found."""
+    img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    dark = cv2.inRange(hsv, (0, 0, 0), (180, 120, 85))
+    dark[: int(h * 0.35), :] = 0                       # the floor is in the lower frame
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    edges = cv2.Canny(dark, 50, 150)
+    segs = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=25, minLineLength=int(h * 0.08), maxLineGap=8)
+    if segs is None:
+        return None
+    lines = []
+    for x1, y1, x2, y2 in segs[:, 0]:
+        if y1 == y2:
+            continue
+        ang = math.degrees(math.atan2(abs(x2 - x1), abs(y2 - y1)))   # 0 = vertical
+        if ang > 65:
+            continue
+        # line as (a,b,c): a*x + b*y + c = 0
+        a = y2 - y1; b = x1 - x2; c = -(a * x1 + b * y1)
+        nrm = math.hypot(a, b) or 1.0
+        lines.append((a / nrm, b / nrm, c / nrm, (x1, y1, x2, y2)))
+    if len(lines) < 2:
+        return None
+    # vanishing point: median of pairwise intersections of non-parallel lines
+    vps = []
+    for i in range(len(lines)):
+        for j in range(i + 1, len(lines)):
+            a1, b1, c1, _ = lines[i]; a2, b2, c2, _ = lines[j]
+            det = a1 * b2 - a2 * b1
+            if abs(det) < 0.05:
+                continue
+            x = (b1 * c2 - b2 * c1) / det; y = (a2 * c1 - a1 * c2) / det
+            if -w < x < 2 * w and -h < y < h * 0.7:
+                vps.append((x, y))
+    if len(vps) < 2:
+        return None
+    vx = float(np.median([v[0] for v in vps])); vy = float(np.median([v[1] for v in vps]))
+    fx = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
+    yaw = math.degrees(math.atan2(vx - w / 2.0, fx))
+    # lateral: where the dark centerline sits across the bottom rows
+    band = dark[int(h * 0.82):, :]
+    cols = np.where(band.mean(axis=0) > 60)[0]
+    lat = None
+    if len(cols):
+        # take the densest run of dark columns (the centerline is the widest dark stripe)
+        runs = []; start = cols[0]; prev = cols[0]
+        for cc in cols[1:]:
+            if cc != prev + 1:
+                runs.append((start, prev)); start = cc
+            prev = cc
+        runs.append((start, prev))
+        a, b = max(runs, key=lambda r: r[1] - r[0])
+        if b - a >= 6:
+            lat = round(float((a + b) / 2.0) / w - 0.5, 3)
+    return {"yaw_deg": round(yaw, 1), "vp_x": round(vx / w - 0.5, 3), "vp_y": round(vy / h, 3), "lat": lat, "lines": len(lines), "vps": len(vps)}
 
 
 def dock_led_green(jpeg: bytes):
@@ -1887,6 +1958,13 @@ async def _dock_stage_approach():
         if tag and tag.get("z_m") is not None:
             z = tag["z_m"]; yaw = tag.get("yaw_deg", 0.0); x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
             far_offaxis = False   # the staging-point chase is retired; the crab manoeuvre below handles off-axis
+            # ★ run 21: tag-pose yaw at 2 m is ±15° of noise plus a sign ambiguity - it staged at -29°
+            #   and rode up onto the stand. The runway lines give a yaw that does not flip.
+            rw = see.get("runway") if see else None
+            if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3 and abs(rw["yaw_deg"]) < 60:
+                yaw = rw["yaw_deg"]
+                if rw.get("lat") is not None:
+                    lat = rw["lat"] * max(0.5, z)   # bottom-of-frame offset scaled to metres-ish
             # yaw glitch filter: median of the last three readings
             yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-3]
             yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
@@ -1937,6 +2015,8 @@ async def _dock_stage_approach():
                         await _dock_axis_crab(learner, yaw_med)
                     _dock["_yaw_hist"] = []
                     continue
+                if abs(yaw_med) > DOCK["yaw_ok_deg"]:
+                    await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
                 await _dock_send(0, 0)
                 _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
                 return True
@@ -2226,6 +2306,12 @@ async def _dock_final(z_from: float):
             _dock_final._stall_n = 0
     await _dock_send(0, 0)
     _dock_set("contact", "at the stand (%s) - watching for charge" % (("seated: width %.2f, offset %+.0f%%" % (seated["width"], (seated["cx"] - cx0) * 100)) if seated else ("wheels stalled" if stalled else "ran out of time")))
+    # ★ run 21 (photo: rover sideways on top of the stand, "docked - charging 70% → 73%"): the gauge SAGS
+    #   under motor load and rebounds at rest - that rebound is not a charge. Rest 8 s and take the
+    #   baseline from the resting reading; and a run that never saw the seat marks centered cannot be
+    #   confirmed by the battery alone - it needs the LED or a long, sustained rise.
+    await asyncio.sleep(8.0)
+    seat_ok = bool(seated) and abs((seated.get("cx") or 0) - cx0) <= DOCK["seat_cx_tol"] * 2
     b0 = _dock_battery(); tw = time.time(); nudged = False
     # ★ Cap: "your charging detector is really delayed… how is the AI gonna detect that?" It can't from
     #   battery % alone — that is an integer that moves once every several minutes. So we now record the
@@ -2255,8 +2341,8 @@ async def _dock_final(z_from: float):
             rise_n = 0
         if time.time() - last_raw >= 10:
             last_raw = time.time(); _docklog_event("raw_telemetry", "+%ds after contact" % int(time.time() - tw), {"raw": telemetry_hub.latest})
-        if b0 is not None and b is not None and b >= b0 + 1 and rise_n >= 2:
-            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); _odo_set_home("self-dock charging"); return True
+        if b0 is not None and b is not None and b >= b0 + 1 and rise_n >= (2 if seat_ok else 6):
+            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%%s" % (b0, b, "" if seat_ok else " (seat unconfirmed - long rise)")); _odo_set_home("self-dock charging"); return True
         if b0 is not None and b is not None and b0 >= 99:
             _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
         if time.time() - tw > DOCK["charge_wait_s"]:
