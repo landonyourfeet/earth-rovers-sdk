@@ -1199,7 +1199,7 @@ def _docklog_tick(stage, cam, see, linear, angular, note=None):
         "tag": ({k: tag.get(k) for k in ("x_err", "side_px", "x_m", "z_m", "yaw_deg", "stage_bearing_deg", "stage_dist_m", "mirrored")} if tag else None),
         "sheet": ({k: sheet.get(k) for k in ("x_err", "ratio", "cy")} if sheet else None),
         "lane_err": see.get("lane_err") if see else None,
-        "hdg": _dock_heading(), "rpms0": _dock_rpms_zero(), "bat": d.get("battery"), "spd": d.get("speed"), "note": note,
+        "hdg": _dock_heading(), "rpms0": _dock_rpms_zero(), "bat": d.get("battery"), "v": d.get("voltage"), "i": d.get("current"), "pw": d.get("power"), "spd": d.get("speed"), "note": note,
     })
 def _docklog_snap(label, jpeg):
     if not jpeg or len(_docklog["snaps"]) >= _DOCKLOG_MAX_SNAPS:
@@ -1987,21 +1987,26 @@ async def _dock_final(z_from: float):
     while time.time() - t0 < DOCK["final_max_s"] + 10:
         fr = await _dock_frame("rear"); seat = dock_seat(fr.jpeg) if fr else None
         _dock["sense"] = {"cam": "rear", "seat": seat}
+        # ★ run 11: stopped 2 inches short with the frame "at target" - the screenshot-derived width was
+        #   not the real charge depth. The stand itself is the physical stop: keep creeping back, steering
+        #   on the seat marks, until the wheels stall against it (or, if a live calibration exists, until the
+        #   calibrated width). Depth by geometry only ever pulls us FORWARD if we are past the calibration.
+        calibrated = bool(ref)
         if seat:
             dx = seat["cx"] - cx0
-            if abs(seat["width"] - tw0) <= tol and abs(dx) <= DOCK["seat_cx_tol"]:
+            if calibrated and abs(seat["width"] - tw0) <= tol and abs(dx) <= DOCK["seat_cx_tol"]:
                 await _dock_send(0, 0); seated = seat; break
-            if seat["width"] > tw0 + tol:
+            if calibrated and seat["width"] > tw0 + tol:
                 await _dock_send(DOCK["seat_creep"], 0.0); _dock_set("final", "seating - too deep (width %.2f), easing forward" % seat["width"])
             else:
                 ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else -DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
-                await _dock_send(-DOCK["seat_creep"], ang); _dock_set("final", "seating - width %.2f/%.2f, offset %+.0f%%" % (seat["width"], tw0, dx * 100))
+                await _dock_send(-DOCK["seat_creep"], ang); _dock_set("final", "seating - creeping to the stand · width %.2f · offset %+.0f%%" % (seat["width"], dx * 100))
         else:
             await _dock_send(-DOCK["rev_final"], 0.0); _dock_set("final", "rolling back - waiting for the sheet to fill the frame")
         _dock_log_tick("final", "seat=%s" % (seat,))
         await asyncio.sleep(1.0 / DOCK["hz"])
-        if time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero() and not seat:
-            stalled = True; break
+        if time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero():
+            stalled = True; seated = seat; break
     await _dock_send(0, 0)
     _dock_set("contact", "at the stand (%s) - watching for charge" % (("seated: width %.2f, offset %+.0f%%" % (seated["width"], (seated["cx"] - cx0) * 100)) if seated else ("wheels stalled" if stalled else "ran out of time")))
     b0 = _dock_battery(); tw = time.time(); nudged = False
