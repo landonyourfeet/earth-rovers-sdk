@@ -385,6 +385,16 @@ class BrowserService:
             retry_on_disconnect=False,
         )
 
+    # ★ OKCREAL (Sep 5, 2026): rover microphone tap on/off (see setAudioTap in
+    #   static/basicVideoCall.js). Never relaunches the browser for this.
+    async def audio_tap(self, on: bool):
+        return await self._run(
+            lambda page: page.evaluate(
+                "async (on) => await window.setAudioTap(on)", bool(on)
+            ),
+            retry_on_disconnect=False,
+        )
+
     async def speak(self, audio_url: str):
         return await self._run(
             lambda page: page.evaluate(
