@@ -1145,7 +1145,7 @@ DOCK = {
     #   out. Back-solving from the tag's pixel size (41 px @640 at 1.5 m) the FRONT lens is ~76° wide, not the
     #   110° I assumed - every front-camera distance was ~1.8× short. Front and rear now have their own FOV.
     "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "76")),             # FRONT camera horizontal FOV
-    "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "110")),  # REAR camera horizontal FOV (unverified)
+    "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "76")),   # run 14: rear read 0.32 m where the front had just staged at 0.69 m → same ~76° lens
     "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
@@ -1889,8 +1889,17 @@ async def _dock_stage_back():
                 yaw_now = yaw_prev
             yaw_prev = yaw_now
             yaw_w = 0.8 if tag["side_px"] >= DOCK["yaw_min_px"] else 0.0
-            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(yaw_now) * yaw_w))
+            # ★ run 14 log: reversing with +angular took yaw from +19° to +26° - the yaw term had the wrong sign
+            #   relative to the lateral term. Positive yaw needs NEGATIVE angular.
+            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) - math.radians(yaw_now) * yaw_w))
             offaxis_n = offaxis_n + 1 if abs(tag["x_m"]) > 0.15 else 0
+            if tag["side_px"] >= DOCK["yaw_min_px"] and abs(yaw_now) > DOCK["final_yaw_deg"] * 2 and abs(tag["x_m"]) < 0.12:
+                # ★ Cap (run 14): "it didn't care where it was - when it saw it, it headed for it." Crooked but
+                #   centered: square up FIRST (pulse against the yaw), then reverse. Never seat at an angle.
+                _dock_set("square_rear", "squaring to the dock · yaw %+d°" % yaw_now); rev_since = None
+                await _dock_pulse_turn(-1 if yaw_now > 0 else 1, "rear")
+                _dock_log_tick("back", "square pulse yaw=%+d" % yaw_now)
+                continue
             ref = "tag %.2fm lat %+.2f yaw %+d°" % (tag["z_m"], tag["x_m"], tag.get("yaw_deg", 0))
             last_close = (tag["z_m"], tag["x_m"])
         elif tag:
