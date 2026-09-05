@@ -555,3 +555,39 @@ async function playAudioToRover(audioUrl) {
   });
 }
 window.playAudioToRover = playAudioToRover;
+
+// ★ OKCREAL (Sep 4, 2026): play a LIVE audio stream (e.g. an internet radio
+//   station) through the rover speaker until stopped. playAudioToRover fetches
+//   a whole file and decodes it, so it cannot take an endless stream; this
+//   uses an <audio> element as the source and keeps the custom track
+//   published until window.stopLiveAudioToRover() is called.
+let _liveAudio = null;
+async function playLiveAudioToRover(streamUrl) {
+  await stopLiveAudioToRover();
+  const el = document.createElement("audio");
+  el.crossOrigin = "anonymous";
+  el.src = streamUrl;
+  el.preload = "none";
+  const audioContext = new AudioContext({ sampleRate: 48000 });
+  if (audioContext.state === "suspended") await audioContext.resume();
+  const source = audioContext.createMediaElementSource(el);
+  const destination = audioContext.createMediaStreamDestination();
+  source.connect(destination);
+  const audioTrack = AgoraRTC.createCustomAudioTrack({ mediaStreamTrack: destination.stream.getAudioTracks()[0] });
+  await client.publish(audioTrack);
+  await el.play();
+  _liveAudio = { el, audioContext, audioTrack };
+  return "playing";
+}
+async function stopLiveAudioToRover() {
+  if (!_liveAudio) return "idle";
+  const { el, audioContext, audioTrack } = _liveAudio; _liveAudio = null;
+  try { el.pause(); el.src = ""; } catch (e) {}
+  try { await client.unpublish(audioTrack); audioTrack.close(); } catch (e) {}
+  try { await audioContext.close(); } catch (e) {}
+  return "stopped";
+}
+function liveAudioStatus() { return _liveAudio ? { playing: !_liveAudio.el.paused, src: _liveAudio.el.currentSrc } : { playing: false }; }
+window.playLiveAudioToRover = playLiveAudioToRover;
+window.stopLiveAudioToRover = stopLiveAudioToRover;
+window.liveAudioStatus = liveAudioStatus;
