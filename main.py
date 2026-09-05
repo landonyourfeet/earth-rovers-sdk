@@ -1170,7 +1170,7 @@ DOCK = {
     #   turns and searches PULSE — rotate, stop, settle, look — and a lost marker
     #   is only declared lost from a settled (stopped) frame.
     "pulse_s": float(os.getenv("DOCK_PULSE_S", "0.5")),          # rotate this long per pulse
-    "pulse_turn_s": float(os.getenv("DOCK_PULSE_TURN_S", "0.18")),   # alignment pulse (a few degrees), then settle and look
+    "pulse_turn_s": float(os.getenv("DOCK_PULSE_TURN_S", "0.3")),    # alignment pulse (~5-8°), then settle and look
     "settle_s": float(os.getenv("DOCK_SETTLE_S", "0.45")),        # stop this long before looking
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
     "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "-1")),     # ★ run 7 log: +1 drove the lateral offset from -8 cm to -21 cm; the learner flipped it to -1
@@ -1591,9 +1591,73 @@ async def _dock_pulse_turn(direction: float, cam: str):
     """★ run 8 log: continuous in-place turns at the dead-zone floor (0.38–0.42) overshot by 10–30° per
     tick and the rover hunted left-right for a minute, then stalled sideways on the mat. Alignment
     turns are now PULSES: a short burst, stop, settle, look again."""
-    await _dock_send(0, DOCK["ang_min_inplace"] * (1 if direction > 0 else -1))
+    # ★ run 9 log: 0.38 for 0.18 s did not move the rover at all (heading 129-131° for 170 s). The spin
+    #   rate that demonstrably turns it is DOCK["spin"]; the pulse uses that.
+    await _dock_send(0, DOCK["spin"] * (1 if direction > 0 else -1))
     await asyncio.sleep(DOCK["pulse_turn_s"])
     return await _dock_settled_look(cam)
+
+
+async def _dock_offaxis_fix(learner):
+    """★ run 9 log: after the 180 the rover sat 33 cm beside the dock axis at 0.66 m. Pulling straight
+    forward and re-approaching reproduced the same geometry three times. This is the manoeuvre a
+    driver does: (A) turn until the tag is centered in the rear camera, (B) back up along that line
+    until ~0.4 m, (C) turn until we are parallel to the dock axis (tag yaw ≈ 0), (D) drive forward
+    ~0.6 m keeping the tag centered. Net effect: same distance, now ON the axis. Returns True if it
+    completed with the tag still in view."""
+    _dock_set("offaxis", "3-point correction: (A) point the tail at the dock")
+    for _ in range(14):
+        see = await _dock_settled_look("rear"); tag = see and see.get("tag")
+        if not tag:
+            return False
+        if abs(tag["x_err"]) <= 0.05:
+            break
+        learner.observe(tag["x_err"], True)
+        await _dock_pulse_turn(learner.sign() * tag["x_err"], "rear")
+    _dock_set("offaxis", "3-point correction: (B) backing toward the dock")
+    t0 = time.time()
+    while time.time() - t0 < 8:
+        see = await _dock_settled_look("rear") if int((time.time() - t0) * 2) % 3 == 0 else None
+        if see is None:
+            fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None
+        tag = see and see.get("tag")
+        if not tag or tag.get("z_m") is None:
+            break
+        if tag["z_m"] <= 0.40:
+            break
+        ang = 0.0 if abs(tag["x_err"]) < 0.04 else max(-0.2, min(0.2, learner.sign() * tag["x_err"] * DOCK["turn_gain"]))
+        await _dock_send(-DOCK["rev_near"], ang)
+        _dock_log_tick("offaxis", "B z=%.2f" % tag["z_m"])
+        await asyncio.sleep(1.0 / DOCK["hz"])
+    await _dock_send(0, 0)
+    _dock_set("offaxis", "3-point correction: (C) squaring to the dock axis")
+    spin = _dock["sign"]["spin"]
+    for _ in range(12):
+        see = await _dock_settled_look("rear"); tag = see and see.get("tag")
+        if not tag:
+            return False
+        yaw = tag.get("yaw_deg") or 0.0
+        if abs(yaw) <= 8:
+            break
+        y0 = yaw
+        await _dock_pulse_turn(spin * (1 if yaw > 0 else -1), "rear")
+        see2 = await _dock_settled_look("rear"); t2 = see2 and see2.get("tag")
+        if t2 and abs(t2.get("yaw_deg") or 0.0) > abs(y0) + 3:
+            spin *= -1; _dock["sign"]["spin"] = spin; _docklog_event("sign_flip", "offaxis yaw spin → %+d" % int(spin))
+    _dock_set("offaxis", "3-point correction: (D) pulling forward along the axis")
+    t0 = time.time()
+    while time.time() - t0 < DOCK["stage_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"]) + 1.0:
+        fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None; tag = see and see.get("tag")
+        ang = 0.0
+        if tag and abs(tag["x_err"]) >= 0.04:
+            ang = max(-0.2, min(0.2, -learner.sign() * tag["x_err"] * DOCK["turn_gain"]))   # forward: opposite sense
+        await _dock_send(DOCK["fwd_near"], ang)
+        _dock_log_tick("offaxis", "D")
+        await asyncio.sleep(1.0 / DOCK["hz"])
+    await _dock_send(0, 0)
+    see = await _dock_settled_look("rear"); tag = see and see.get("tag")
+    _docklog_event("offaxis", "correction done: %s" % ("tag lat %+.2f z %.2f yaw %+d" % (tag.get("x_m") or 0, tag.get("z_m") or 0, tag.get("yaw_deg") or 0) if tag else "tag not in view"))
+    return bool(tag)
 
 
 class _SignLearner:
@@ -1765,22 +1829,29 @@ async def _dock_stage_turn():
         if h is not None and hp is not None:
             d = ((h - hp + 540.0) % 360.0) - 180.0; turned += abs(d); hp = h
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
-        hit = (tag and abs(tag["x_err"]) < 0.22) or (sheet and abs(sheet["x_err"]) < 0.18 and sheet["ratio"] >= 0.03)
+        hit = (tag and abs(tag["x_err"]) < 0.08) or (sheet and not tag and abs(sheet["x_err"]) < 0.12 and sheet["ratio"] >= 0.03)
         if tag and not hit:
-            # ★ run 5 log: the rear camera HAD the tag at +46%…+28% off-center for the last 6 s of the turn
-            #   and the turn still timed out. Once the tag is in the rear frame, finish by centering it.
-            _dock_set("turn", "180° — rear cam has the tag at %+d%%, centering" % int(tag["x_err"] * 100))
-            for _ in range(12):
-                await _dock_send(0, DOCK["spin"] * _dock["sign"]["rear"] * (1 if tag["x_err"] > 0 else -1))
-                await asyncio.sleep(0.35)
+            # ★ Cap (run 9, watching the feed): "as soon as the tag comes into view it stops and starts slowly
+            #   turning back the other way, then gets lost." The tag enters from the edge the rotation is
+            #   sweeping toward — so KEEP TURNING THE SAME WAY until it is centered. No sign guessing: the
+            #   direction that brought it into view is the direction that centers it; flip only if it
+            #   measurably moves away.
+            _dock_set("turn", "180° — rear cam has the tag at %+d%%, finishing the turn" % int(tag["x_err"] * 100))
+            direction = sign
+            for _ in range(16):
+                await _dock_send(0, DOCK["spin"] * direction)
+                await asyncio.sleep(DOCK["pulse_turn_s"])
                 see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
+                _dock_log_tick("turn", "centering %+d%%" % int((t2 or tag)["x_err"] * 100))
                 if not t2:
                     break
-                if abs(t2["x_err"]) > abs(tag["x_err"]) + 0.03:
-                    _dock["sign"]["rear"] *= -1; _docklog_event("sign_flip", "rear centering sign → %+d" % int(_dock["sign"]["rear"]))
+                if abs(t2["x_err"]) > abs(tag["x_err"]) + 0.04:
+                    direction *= -1; _docklog_event("sign_flip", "turn centering direction → %+d" % int(direction))
                 tag = t2
-                if abs(tag["x_err"]) < 0.22:
+                if abs(tag["x_err"]) < 0.08:
                     hit = True; break
+            if hit:
+                _dock["sign"]["rear"] = direction if tag["x_err"] >= 0 else -direction   # what centers a tag on the + side
         _dock_set("turn", "180° — turned ~%d°, rear cam: %s" % (turned, "TAG" if tag else "sheet" if sheet else "nothing yet"))
         _dock_log_tick("turn", "turned~%d" % turned)
         if hit:
@@ -1849,11 +1920,11 @@ async def _dock_stage_back():
             continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
-        if tag and tag.get("z_m") is not None and tag.get("x_m") is not None and tag["z_m"] < 0.65 and abs(tag["x_m"]) > 0.10 and reseats < DOCK["reseat_max"]:
-            # ★ run 7 log: 21 cm off-axis at 0.5 m cannot be steered out while reversing - go around again
+        if tag and tag.get("z_m") is not None and tag.get("x_m") is not None and tag["z_m"] < 0.80 and abs(tag["x_m"]) > 0.10 and reseats < DOCK["reseat_max"]:
+            # off the dock axis close in: a differential rover cannot crab - do the 3-point correction
             reseats += 1
-            _dock_set("reseat", "%.0f cm off the dock axis at %.2f m - pulling forward to re-approach (%d/%d)" % (abs(tag["x_m"]) * 100, tag["z_m"], reseats, DOCK["reseat_max"]))
-            await _dock_send(DOCK["fwd_near"], -learner.sign() * 0.25 * (1 if tag["x_m"] > 0 else -1)); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+            _dock_set("reseat", "%.0f cm off the dock axis at %.2f m - 3-point correction (%d/%d)" % (abs(tag["x_m"]) * 100, tag["z_m"], reseats, DOCK["reseat_max"]))
+            await _dock_offaxis_fix(learner)
             rev_since = None; _dock["last_seen"] = None; continue
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
@@ -1928,10 +1999,18 @@ async def _dock_final(z_from: float):
     await _dock_send(0, 0)
     _dock_set("contact", "at the stand (%s) - watching for charge" % (("seated: width %.2f, offset %+.0f%%" % (seated["width"], (seated["cx"] - cx0) * 100)) if seated else ("wheels stalled" if stalled else "ran out of time")))
     b0 = _dock_battery(); tw = time.time(); nudged = False
+    # ★ Cap: "your charging detector is really delayed… how is the AI gonna detect that?" It can't from
+    #   battery % alone — that is an integer that moves once every several minutes. So we now record the
+    #   ENTIRE raw telemetry payload at contact and every 10 s after, to find any field (voltage, current,
+    #   a flag) that reacts the instant the coil couples. If one exists, it becomes the detector.
+    _docklog_event("raw_telemetry", "at contact", {"raw": telemetry_hub.latest})
+    last_raw = time.time()
     while True:
         await asyncio.sleep(3.0)
         b = _dock_battery()
         _dock_log_tick("contact", "bat %s->%s" % (b0, b))
+        if time.time() - last_raw >= 10:
+            last_raw = time.time(); _docklog_event("raw_telemetry", "+%ds after contact" % int(time.time() - tw), {"raw": telemetry_hub.latest})
         if b0 is not None and b is not None and b >= b0 + 1:
             _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%" % (b0, b)); _odo_set_home("self-dock charging"); return True
         if b0 is not None and b is not None and b0 >= 99:
