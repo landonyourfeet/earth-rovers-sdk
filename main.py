@@ -939,6 +939,10 @@ async def control(request: Request):
     if not command:
         raise HTTPException(status_code=400, detail="Command not provided")
 
+    # ★ OKCREAL (Sep 5, 2026): a manual drive command or an explicit dock stop
+    #   aborts self-docking — the human always wins.
+    if _dock_active() and (_command_is_moving(command) or body.get("dock") == "stop"):
+        await _dock_cancel("manual control")
     # Arm BEFORE dispatch: if the send times out ambiguously the rover may
     # still have received the motion command — the watchdog must cover it.
     arm_control_watchdog(command)
@@ -1055,6 +1059,243 @@ async def audio_feed():
         media_type="application/octet-stream",
         headers={"X-Audio-Format": "pcm_s16le;rate=16000;channels=1", "Cache-Control": "no-store"},
     )
+
+
+# ★ OKCREAL (Sep 5, 2026 — Cap: "we have built a dock. need self docking
+#   capability now"). The dock is a mat with MAGENTA chevron rails down both
+#   edges and a charging stand at its head carrying a crosshair target with a
+#   magenta bullseye. Measured on Cap's own console shots: the rails are the
+#   reliable far/mid-range cue (the bullseye is a few pale pixels beyond ~1 m
+#   and washes out), and the bullseye becomes a big round blob only at the
+#   stand. So the controller LANE-FOLLOWS the rails — centers the rover
+#   between the two rail clusters (or offsets from a lone rail) and creeps up
+#   the mat — and calls DOCKED when either the bullseye fills DOCK_DOT_DONE of
+#   the frame width or the wheels stall against the stand (forward commanded,
+#   rpms ~0). Lost mat → stop, slow search turn, give up after DOCK_SEARCH_S.
+#   Any manual motion on /control aborts. Creep speeds sit under the wall-flip
+#   threshold. Every tunable is an env var.
+import cv2  # noqa: E402  (dependency via video_feed)
+import numpy as np  # noqa: E402
+
+DOCK = {
+    "hue_lo": int(os.getenv("DOCK_HUE_LO", "135")),      # OpenCV hue 0–180: mat rails + bullseye ≈ 145–160
+    "hue_hi": int(os.getenv("DOCK_HUE_HI", "180")),
+    "sat_min": int(os.getenv("DOCK_SAT_MIN", "60")),
+    "val_min": int(os.getenv("DOCK_VAL_MIN", "60")),
+    "min_ratio": float(os.getenv("DOCK_MIN_RATIO", "0.008")),
+    "lane_half": float(os.getenv("DOCK_LANE_HALF", "0.33")),      # lone rail → lane center offset (fraction of width)
+    "dot_done_ratio": float(os.getenv("DOCK_DOT_DONE", "0.07")),  # bullseye width / frame width = at the stand
+    "creep": float(os.getenv("DOCK_CREEP", "0.12")),
+    "creep_near": float(os.getenv("DOCK_CREEP_NEAR", "0.08")),
+    "near_area": float(os.getenv("DOCK_NEAR_AREA", "0.010")),    # rail pixel area fraction → close to the stand
+    "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")),
+    "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.30")),
+    "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")),
+    "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
+    "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.22")),
+    "search_s": float(os.getenv("DOCK_SEARCH_S", "20")),
+    "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "150")),
+    "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
+    "hz": float(os.getenv("DOCK_HZ", "5")),
+}
+_dock = {"task": None, "state": "idle", "phase": None, "since": None, "reason": None,
+         "sense": None, "started_at": None, "last_seen": None, "cmds": 0}
+
+
+def dock_sense(jpeg):
+    img=cv2.imdecode(np.frombuffer(jpeg,np.uint8),cv2.IMREAD_COLOR)
+    if img is None: return None
+    h,w=img.shape[:2]
+    if w>480:
+        img=cv2.resize(img,(480,int(h*480.0/w))); h,w=img.shape[:2]
+    hsv=cv2.cvtColor(img,cv2.COLOR_BGR2HSV)
+    mask=cv2.inRange(hsv,(DOCK["hue_lo"],DOCK["sat_min"],DOCK["val_min"]),(DOCK["hue_hi"],255,255))
+    mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3),np.uint8))
+    cs,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    blobs=[]
+    for c in cs:
+        a=cv2.contourArea(c)
+        if a<6: continue
+        x,y,bw,bh=cv2.boundingRect(c)
+        blobs.append({"x":(x+bw/2)/w,"y":(y+bh/2)/h,"w":bw/w,"h":bh/h,"asp":bw/float(bh),"a":a/(w*h)})
+    if not blobs: return {"seen":False}
+    # the bullseye up close: a big round blob anywhere in the frame = we are at the stand
+    for b in sorted(blobs,key=lambda b:-b["a"]):
+        r=b["w"]; asp=b["asp"]
+        if r>=DOCK["dot_done_ratio"] and 0.7<asp<1.5:
+            return {"seen":True,"dot":{"x_err":b["x"]-0.5,"ratio":round(r,4),"cy":round(b["y"],3),"big":True},"rails":None,"lane_err":None}
+    # rails: blobs in the lower 60% of the frame; dot: the highest sizeable blob above them
+    rails=[b for b in blobs if b["y"]>0.35]
+    top=[b for b in blobs if b["y"]<=0.35 and b["w"]>=DOCK["min_ratio"]]
+    dot=None
+    if top:
+        d=max(top,key=lambda b:b["a"]); dot={"x_err":d["x"]-0.5,"ratio":round(d["w"],4),"cy":round(d["y"],3)}
+    out={"seen":True,"dot":dot,"rails":None,"lane_err":None}
+    if rails:
+        xs=sorted(b["x"] for b in rails)
+        med=np.median(xs)
+        left=[b for b in rails if b["x"]<=med]; right=[b for b in rails if b["x"]>med]
+        lx=np.average([b["x"] for b in left],weights=[b["a"] for b in left]) if left else None
+        rx=np.average([b["x"] for b in right],weights=[b["a"] for b in right]) if right else None
+        if lx is not None and rx is not None and (rx-lx)>0.12:
+            center=(lx+rx)/2; kind="both"
+        else:
+            # one rail (or the two clusters are really one): assume left rail if it sits left of center
+            x=np.average([b["x"] for b in rails],weights=[b["a"] for b in rails])
+            center = x+DOCK["lane_half"] if x<0.5 else x-DOCK["lane_half"]; kind="left" if x<0.5 else "right"
+        area=sum(b["a"] for b in rails)
+        out["rails"]={"kind":kind,"left":(round(float(lx),3) if lx is not None else None),"right":(round(float(rx),3) if rx is not None else None),"area":round(float(area),4),"n":len(rails)}
+        out["lane_err"]=round(float(center)-0.5,3)
+    return out
+
+
+def _dock_rpms_zero() -> bool:
+    d = telemetry_hub.latest or {}
+    rp = d.get("rpms") or []
+    if not rp:
+        return False
+    try:
+        last = rp[-1]
+        return all(abs(float(v)) < 1.0 for v in last[:4])
+    except Exception:
+        return False
+
+
+async def _dock_send(linear: float, angular: float):
+    cmd = {"linear": round(linear, 3), "angular": round(angular, 3), "lamp": 0}
+    arm_control_watchdog(cmd)
+    _dock["cmds"] += 1
+    try:
+        await _dispatch_browser_control(cmd)
+    except Exception as e:
+        logger.warning("dock: control send failed: %s", e)
+
+
+def _dock_set(phase, reason=None):
+    if _dock["phase"] != phase:
+        _dock["phase"] = phase
+        _dock["since"] = time.time()
+        logger.info("dock: %s%s", phase, (" — " + reason) if reason else "")
+    if reason:
+        _dock["reason"] = reason
+
+
+async def _dock_loop():
+    period = 1.0 / max(1.0, DOCK["hz"])
+    broadcaster = feed_broadcasters["front"]
+    _dock["state"] = "docking"; _dock["started_at"] = time.time(); _dock["last_seen"] = None
+    _dock["sense"] = None; _dock["reason"] = None; _dock["cmds"] = 0
+    _dock_set("acquire")
+    forward_since = None
+    search_dir = 1.0
+    try:
+        while True:
+            now = time.time()
+            if now - _dock["started_at"] > DOCK["timeout_s"]:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("timeout", "gave up after %ds" % DOCK["timeout_s"]); return
+            frame = None
+            try:
+                frame = await broadcaster.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
+            except Exception as e:
+                logger.warning("dock: frame error: %s", e)
+            sense = dock_sense(frame.jpeg) if frame else None
+            _dock["sense"] = sense
+            dot = (sense or {}).get("dot") if sense else None
+            lane_err = (sense or {}).get("lane_err") if sense else None
+            if dot and dot.get("big"):
+                await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "bullseye at the stand"); return
+            if lane_err is None:
+                if _dock["last_seen"] is None:
+                    _dock["last_seen"] = now
+                lost_for = now - _dock["last_seen"]
+                if lost_for < 1.5:
+                    await _dock_send(0, 0); _dock_set("lost", "mat out of view")
+                elif lost_for < 1.5 + DOCK["search_s"]:
+                    _dock_set("search", "turning to find the mat")
+                    await _dock_send(0, DOCK["search_turn"] * search_dir)
+                else:
+                    await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return
+                forward_since = None
+                await asyncio.sleep(period)
+                continue
+            _dock["last_seen"] = now
+            search_dir = -1.0 if lane_err > 0 else 1.0
+            rails = sense.get("rails") or {}
+            angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], -lane_err * DOCK["turn_gain"]))
+            if abs(lane_err) > DOCK["turn_only"]:
+                linear = 0.0; _dock_set("align", "centering on the mat")
+                forward_since = None
+            else:
+                if abs(lane_err) < DOCK["center_tol"]:
+                    angular = 0.0
+                near = (rails.get("area") or 0) >= DOCK["near_area"]
+                linear = DOCK["creep_near"] if near else DOCK["creep"]
+                _dock_set("approach", "creeping up the mat" + (" (near)" if near else ""))
+                forward_since = forward_since or now
+                if now - forward_since > DOCK["stall_s"] and _dock_rpms_zero():
+                    await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "wheels stalled against the stand"); return
+            await _dock_send(linear, angular)
+            await asyncio.sleep(period)
+    except asyncio.CancelledError:
+        try:
+            await _dock_send(0, 0)
+        finally:
+            if _dock["state"] == "docking":
+                _dock["state"] = "aborted"; _dock_set("aborted", _dock.get("reason") or "cancelled")
+        raise
+    except Exception as e:
+        logger.error("dock: loop error: %s", e)
+        try:
+            await _dock_send(0, 0)
+        except Exception:
+            pass
+        _dock["state"] = "failed"; _dock_set("error", str(e)[:120])
+
+
+def _dock_active() -> bool:
+    t = _dock["task"]
+    return bool(t and not t.done())
+
+
+async def _dock_cancel(reason: str):
+    t = _dock["task"]
+    if t and not t.done():
+        _dock["reason"] = reason
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await t
+
+
+def _dock_status():
+    return {"active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"],
+            "sense": _dock["sense"], "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
+            "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
+
+
+@app.get("/dock")
+async def dock_get():
+    return _dock_status()
+
+
+@app.post("/dock")
+async def dock_post(request: Request):
+    await need_start_mission()
+    if not auth_response_data:
+        await auth()
+    body = await request.json()
+    action = (body or {}).get("action", "start")
+    if action == "stop":
+        await _dock_cancel("stopped by operator")
+        return _dock_status()
+    if action == "test":
+        # one frame, no motion — what the docker sees right now
+        frame = await feed_broadcasters["front"].get_frame(max_age=0.5, timeout=3.0, fps=5)
+        return {"sense": dock_sense(frame.jpeg) if frame else None}
+    if _dock_active():
+        return _dock_status()
+    _dock["task"] = asyncio.create_task(_dock_loop())
+    await asyncio.sleep(0.05)
+    return _dock_status()
 
 
 @app.get("/rtc-config")
