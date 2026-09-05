@@ -1109,9 +1109,27 @@ DOCK = {
     "final_z_m": float(os.getenv("DOCK_FINAL_Z_M", "0.32")),        # tag lost inside this range -> blind final roll
     "rev_final": float(os.getenv("DOCK_REV_FINAL", "0.07")),
     "final_max_s": float(os.getenv("DOCK_FINAL_MAX_S", "10")),      # blind roll cap
-    "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "240")), # how long to wait for the battery to start rising
+    "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "150")), # wait for a battery rise before re-seating
     "nudge_s": float(os.getenv("DOCK_NUDGE_S", "0.8")),             # extra push if no charge after the wait
     "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
+    # Cap, run 6: "almost - off center just slightly; it must be perfectly centered to charge, and it should
+    #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
+    "final_lat_m": float(os.getenv("DOCK_FINAL_LAT_M", "0.035")),   # lateral offset allowed before the final seat
+    "final_yaw_deg": float(os.getenv("DOCK_FINAL_YAW_DEG", "6")),
+    "reseat_m": float(os.getenv("DOCK_RESEAT_M", "0.35")),           # pull forward this far to try again
+    "reseat_max": int(os.getenv("DOCK_RESEAT_MAX", "3")),
+    # Sep 5 12:35 - Cap's MANUAL dock that charged (+6%/hr), measured from his rear-cam screenshot: the tag's
+    #   black square sits centered (x_err -0.014) with its bottom edge at 55% of frame height and a WIDTH of
+    #   0.53 of the frame. Two earlier seats that did NOT charge measured 0.66-0.67 wide - the rover had gone
+    #   in too deep. So the charge position is a FRAME GEOMETRY, and the final approach now drives to it.
+    #   (values below are as measured by dock_seat() at feed resolution; charged = width 0.633 / cx +0.035,
+    #    the two no-charge seats = 0.66-0.67. The margin is thin, so the seat is also CALIBRATED live: Connect
+    #    calls /dock calibrate_seat whenever it sees the battery charging, and that measurement wins.)
+    "seat_cx": float(os.getenv("DOCK_SEAT_CX", "0.035")),
+    "seat_cx_tol": float(os.getenv("DOCK_SEAT_CX_TOL", "0.03")),
+    "seat_width": float(os.getenv("DOCK_SEAT_WIDTH", "0.633")),
+    "seat_width_tol": float(os.getenv("DOCK_SEAT_WIDTH_TOL", "0.02")),
+    "seat_creep": float(os.getenv("DOCK_SEAT_CREEP", "0.06")),
     # ★ Sep 5 run 3 (console: "APPROACH · FRONT CAM · driving to the dock · sheet 1%" while the dock was
     #   behind the rover): a sheet-only cue must PROVE itself — once it is DOCK_SHEET_CONFIRM wide the tag
     #   should decode; if it doesn't within DOCK_SHEET_PROVE_S the blob is a purple light, not the dock,
@@ -1370,6 +1388,28 @@ def dock_see(jpeg: bytes, cam: str):
     except Exception:
         pass
     return out
+
+
+def dock_seat(jpeg: bytes):
+    """At the stand the tag is unreadable (clipped), but its black square is the best ruler we have:
+    its center gives lateral offset, its width gives depth. Returns None when no big dark square is seen."""
+    img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mag = cv2.inRange(hsv, (DOCK["sheet_hue_lo"] - 4, 35, 60), (180, 255, 255))
+    if mag.mean() / 255.0 < 0.15:
+        return None                     # the sheet is not filling the frame - not at the stand
+    dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 95))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    cs, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return None
+    c = max(cs, key=cv2.contourArea); x, y, bw, bh = cv2.boundingRect(c)
+    if bw / float(w) < 0.3:
+        return None
+    return {"cx": round((x + bw / 2.0) / w - 0.5, 3), "width": round(bw / float(w), 3), "bottom_y": round((y + bh) / float(h), 3)}
 
 
 def _dock_rpms_zero() -> bool:
@@ -1746,16 +1786,29 @@ async def _dock_final(z_from: float):
     its field of view; roll straight back at DOCK_REV_FINAL until the wheels stall or
     the cap, then hold and watch the battery. Rising battery = docked and charging.
     No rise after DOCK_CHARGE_WAIT_S -> one more push, wait again, then report."""
-    _dock_set("final", "tag out of view at %.2f m - rolling back slowly to the pads" % z_from)
-    t0 = time.time(); stalled = False
-    while time.time() - t0 < DOCK["final_max_s"]:
-        await _dock_send(-DOCK["rev_final"], 0.0)
-        _dock_log_tick("final", "blind roll")
+    _dock_set("final", "tag out of view at %.2f m - seating on the coil by frame geometry" % z_from)
+    ref = _dock.get("seat_ref") or {}
+    t0 = time.time(); stalled = False; seated = None; tw0 = ref.get("width", DOCK["seat_width"]); tol = DOCK["seat_width_tol"]; cx0 = ref.get("cx", DOCK["seat_cx"])
+    while time.time() - t0 < DOCK["final_max_s"] + 10:
+        fr = await _dock_frame("rear"); seat = dock_seat(fr.jpeg) if fr else None
+        _dock["sense"] = {"cam": "rear", "seat": seat}
+        if seat:
+            dx = seat["cx"] - cx0
+            if abs(seat["width"] - tw0) <= tol and abs(dx) <= DOCK["seat_cx_tol"]:
+                await _dock_send(0, 0); seated = seat; break
+            if seat["width"] > tw0 + tol:
+                await _dock_send(DOCK["seat_creep"], 0.0); _dock_set("final", "seating - too deep (width %.2f), easing forward" % seat["width"])
+            else:
+                ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else -DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
+                await _dock_send(-DOCK["seat_creep"], ang); _dock_set("final", "seating - width %.2f/%.2f, offset %+.0f%%" % (seat["width"], tw0, dx * 100))
+        else:
+            await _dock_send(-DOCK["rev_final"], 0.0); _dock_set("final", "rolling back - waiting for the sheet to fill the frame")
+        _dock_log_tick("final", "seat=%s" % (seat,))
         await asyncio.sleep(1.0 / DOCK["hz"])
-        if time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero():
+        if time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero() and not seat:
             stalled = True; break
     await _dock_send(0, 0)
-    _dock_set("contact", "at the stand (%s) - watching for charge" % ("wheels stalled" if stalled else "rolled the full distance"))
+    _dock_set("contact", "at the stand (%s) - watching for charge" % (("seated: width %.2f, offset %+.0f%%" % (seated["width"], (seated["cx"] - cx0) * 100)) if seated else ("wheels stalled" if stalled else "ran out of time")))
     b0 = _dock_battery(); tw = time.time(); nudged = False
     while True:
         await asyncio.sleep(3.0)
@@ -2100,7 +2153,7 @@ def _dock_progress():
 
 
 def _dock_status():
-    return {"return": _return_status(), "odo": _odo_pos(), "active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
+    return {"return": _return_status(), "odo": _odo_pos(), "seat_ref": _dock.get("seat_ref"), "active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
             "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
             "elapsed_s": (round(time.time() - _dock["started_at"], 1) if _dock["started_at"] else None),
             "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
@@ -2130,6 +2183,16 @@ async def dock_post(request: Request):
     if action == "stop":
         await _dock_cancel("stopped by operator")
         return _dock_status()
+    if action == "calibrate_seat":
+        # the rover is on the dock and charging RIGHT NOW: this frame geometry is the truth
+        fr = await feed_broadcasters["rear"].get_frame(max_age=0.5, timeout=3.0, fps=5)
+        seat = dock_seat(fr.jpeg) if fr else None
+        if not seat:
+            return {"ok": False, "error": "rear camera does not see the sheet filling the frame - is the rover on the dock?"}
+        _dock["seat_ref"] = dict(seat, at=time.time())
+        logger.info("dock: SEAT CALIBRATED from a charging position: %s  (set DOCK_SEAT_WIDTH=%s DOCK_SEAT_CX=%s to make it permanent)", seat, seat["width"], seat["cx"])
+        _docklog_event("seat_cal", "seat reference calibrated: %s" % seat)
+        return {"ok": True, "seat": seat}
     if action == "test":
         # one frame from each camera, no motion — what the docker sees right now
         out = {"front": None, "rear": None, "mirror": _dock["mirror"], "heading": _dock_heading()}
