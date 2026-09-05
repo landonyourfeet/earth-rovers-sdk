@@ -1141,11 +1141,19 @@ DOCK = {
     "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
     "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
     "tag_m": float(os.getenv("DOCK_TAG_M", "0.1524")),              # printed tag side: 6 in
-    "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "110")),           # camera horizontal FOV estimate (Mini+ is wide)
+    # ★ run 13 (Cap: "stops way too far away, like 5 feet"): the log said 0.70 m while the rover was ~1.5 m
+    #   out. Back-solving from the tag's pixel size (41 px @640 at 1.5 m) the FRONT lens is ~76° wide, not the
+    #   110° I assumed - every front-camera distance was ~1.8× short. Front and rear now have their own FOV.
+    "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "76")),             # FRONT camera horizontal FOV
+    "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "110")),  # REAR camera horizontal FOV (unverified)
     "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # on-axis enough to turn around
-    "sheet_stop_ratio": float(os.getenv("DOCK_SHEET_STOP_RATIO", "0.32")),  # hard stop: sheet this wide = we are at the stand
+    # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
+    #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
+    #   ~25 cm from the stand, so the 180 happened ON the mat. The letter sheet is 12.6% wide at the 0.6 m staging
+    #   distance; that is the stop now, and the front stage never drives closer than 0.45 m under any cue.
+    "sheet_stop_ratio": float(os.getenv("DOCK_SHEET_STOP_RATIO", "0.30")),   # run 13: the sheet+holder read 12% at 1.5 m → ~30% at 0.6 m
     "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
     "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.42")),
     "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")), "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
@@ -1278,7 +1286,7 @@ def dock_sense(jpeg):
 
 
 
-def _dock_find_tag(gray, w):
+def _dock_find_tag(gray, w, cam="front"):
     """Tag corners → bearing, size, and an approximate 3-D pose (metres, camera
     frame: x right, y down, z forward). Intrinsics are estimated from the
     camera's horizontal field of view (DOCK_HFOV_DEG) — good enough for a
@@ -1294,7 +1302,7 @@ def _dock_find_tag(gray, w):
         side = float(max(np.linalg.norm(q[0] - q[1]), np.linalg.norm(q[1] - q[2])))
         out = {"cx": float(q[:, 0].mean()) / w, "cy": float(q[:, 1].mean()) / h, "side_px": round(side * (640.0 / w), 1)}
         try:
-            fx = (w / 2.0) / math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)
+            fx = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
             K = np.array([[fx, 0, w / 2.0], [0, fx, h / 2.0], [0, 0, 1]], dtype=np.float64)
             L = DOCK["tag_m"] / 2.0
             obj = np.array([[-L, L, 0], [L, L, 0], [L, -L, 0], [-L, -L, 0]], dtype=np.float64)
@@ -1332,7 +1340,7 @@ def dock_see(jpeg: bytes, cam: str):
     mir = _dock["mirror"].get(cam)
     order = [False, True] if mir is None else [bool(mir), not bool(mir)]
     for flipped in order:
-        t = _dock_find_tag(cv2.flip(gray, 1) if flipped else gray, w)
+        t = _dock_find_tag(cv2.flip(gray, 1) if flipped else gray, w, cam)
         if t:
             if flipped:
                 # geometry back into RAW-frame terms (raw image-right = rover's right on a mirrored feed)
@@ -1695,8 +1703,8 @@ async def _dock_stage_approach():
         _dock["sense"] = see; _dock["cam"] = "front"
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
         # ---- hard stops ----
-        if sheet and sheet["ratio"] >= DOCK["sheet_stop_ratio"]:
-            await _dock_send(0, 0); _dock_set("staged", "at the stand (sheet fills the frame) — turning"); return True
+        if sheet and sheet["ratio"] >= DOCK["sheet_stop_ratio"] and not (tag and tag.get("z_m") is not None and tag["z_m"] > DOCK["stage_m"] + 0.15):
+            await _dock_send(0, 0); _dock_set("staged", "sheet %d%% of the frame (~%.1f m) - turning" % (int(sheet["ratio"] * 100), DOCK["stage_m"])); return True
         if tag and tag.get("z_m") is not None and tag["z_m"] < DOCK["stage_m"] * 0.75 and abs(tag["x_err"]) < 0.2:
             await _dock_send(0, 0); _dock_set("staged", "inside staging distance (%.2f m) — turning" % tag["z_m"]); return True
         if tag and tag.get("z_m") is None and tag["side_px"] >= DOCK["tag_turn_px"]:
@@ -1805,7 +1813,7 @@ async def _dock_stage_approach():
         else:
             if abs(x_err) < DOCK["center_tol"]:
                 angular = 0.0
-            linear = DOCK["fwd_near"] if (tag and tag["side_px"] >= DOCK["tag_near_px"]) else DOCK["fwd"]
+            linear = DOCK["fwd_near"] if ((tag and tag["side_px"] >= DOCK["tag_near_px"]) or (sheet and sheet["ratio"] >= DOCK["sheet_stop_ratio"] * 0.6)) else DOCK["fwd"]
             _dock_set("approach", "driving to the dock" + (" · tag %dpx" % tag["side_px"] if tag else " · sheet %d%%" % int(sheet["ratio"] * 100)))
         learner.observe(x_err, angular != 0.0)
         await _dock_send(linear, angular)
