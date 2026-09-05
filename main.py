@@ -1131,10 +1131,10 @@ DOCK = {
     "tag_near_px": float(os.getenv("DOCK_TAG_NEAR_PX", "70")),
     "turn_gain": float(os.getenv("DOCK_TURN_GAIN", "1.4")), "turn_max": float(os.getenv("DOCK_TURN_MAX", "0.42")),
     "center_tol": float(os.getenv("DOCK_CENTER_TOL", "0.05")), "turn_only": float(os.getenv("DOCK_TURN_ONLY", "0.18")),
-    "spin": float(os.getenv("DOCK_SPIN", "0.50")),               # 180° turn rate
+    "spin": float(os.getenv("DOCK_SPIN", "0.70")),               # ★ run 5 log: 0.50 managed ~4°/pulse — the 180 timed out at 97°
     "ang_min_inplace": float(os.getenv("DOCK_ANG_MIN_INPLACE", "0.38")),  # ★ Sep 5 run 2: 0.22 didn't turn the rover — motor dead zone
     "ang_min_moving": float(os.getenv("DOCK_ANG_MIN_MOVING", "0.15")),
-    "spin_tol_deg": float(os.getenv("DOCK_SPIN_TOL_DEG", "8")), "spin_timeout_s": float(os.getenv("DOCK_SPIN_TIMEOUT_S", "25")),
+    "spin_tol_deg": float(os.getenv("DOCK_SPIN_TOL_DEG", "8")), "spin_timeout_s": float(os.getenv("DOCK_SPIN_TIMEOUT_S", "90")),   # ceiling only; the turn is judged in degrees
     "spin_blind_s": float(os.getenv("DOCK_SPIN_BLIND_S", "3.5")),   # no heading data: timed turn
     # ★ Sep 5 run 4 flight log: at 0.40 the search turned ~2°/s (25 s covered ~60°) — the dock was never
     #   swept into view. Search is now spin-and-look by DEGREES: strong pulses until ≥380° of compass
@@ -1563,7 +1563,12 @@ async def _dock_stage_approach():
         # ---- with a pose: navigate to the staging point, then square up ----
         if tag and tag.get("stage_dist_m") is not None:
             sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
-            if sd > DOCK["stage_tol_m"]:
+            # ★ run 5 log: with the staging point only ~0.4 m away its bearing swung ±80° every tick and the
+            #   rover spun in place hunting it, losing the tag three times. Close to the point, the bearing is
+            #   meaningless — what matters is being about DOCK_STAGE_M from the tag, facing it, near its axis.
+            z = tag.get("z_m") or 0.0
+            near_band = abs(z - DOCK["stage_m"]) <= 0.45 and abs(tag["x_err"]) < 0.22 and abs(yaw) <= DOCK["yaw_ok_deg"] * 1.5
+            if sd > DOCK["stage_tol_m"] and not (sd < 0.6 and abs(sb) > 45) and not near_band:
                 # bearing to the staging point drives the steering; forward when roughly pointed at it
                 err = max(-0.5, min(0.5, sb / 60.0))
                 angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * err * DOCK["turn_gain"] * 1.6))
@@ -1625,6 +1630,21 @@ async def _dock_stage_turn():
             d = ((h - hp + 540.0) % 360.0) - 180.0; turned += abs(d); hp = h
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
         hit = (tag and abs(tag["x_err"]) < 0.22) or (sheet and abs(sheet["x_err"]) < 0.18 and sheet["ratio"] >= 0.03)
+        if tag and not hit:
+            # ★ run 5 log: the rear camera HAD the tag at +46%…+28% off-center for the last 6 s of the turn
+            #   and the turn still timed out. Once the tag is in the rear frame, finish by centering it.
+            _dock_set("turn", "180° — rear cam has the tag at %+d%%, centering" % int(tag["x_err"] * 100))
+            for _ in range(12):
+                await _dock_send(0, DOCK["spin"] * _dock["sign"]["rear"] * (1 if tag["x_err"] > 0 else -1))
+                await asyncio.sleep(0.35)
+                see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
+                if not t2:
+                    break
+                if abs(t2["x_err"]) > abs(tag["x_err"]) + 0.03:
+                    _dock["sign"]["rear"] *= -1; _docklog_event("sign_flip", "rear centering sign → %+d" % int(_dock["sign"]["rear"]))
+                tag = t2
+                if abs(tag["x_err"]) < 0.22:
+                    hit = True; break
         _dock_set("turn", "180° — turned ~%d°, rear cam: %s" % (turned, "TAG" if tag else "sheet" if sheet else "nothing yet"))
         _dock_log_tick("turn", "turned~%d" % turned)
         if hit:
