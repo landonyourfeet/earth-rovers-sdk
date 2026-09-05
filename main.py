@@ -1173,7 +1173,7 @@ DOCK = {
     "pulse_turn_s": float(os.getenv("DOCK_PULSE_TURN_S", "0.3")),    # alignment pulse (~5-8°), then settle and look
     "settle_s": float(os.getenv("DOCK_SETTLE_S", "0.45")),        # stop this long before looking
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
-    "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "-1")),     # ★ run 7 log: +1 drove the lateral offset from -8 cm to -21 cm; the learner flipped it to -1
+    "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "1")),      # ★ run 10 log: +angular took a +39% tag to +5% in the rear frame - that IS the sign
 }
 # ★ Sep 5, 2026 (Cap: "create a diagnostic download so you can see the events").
 #   Every run keeps a flight log: phase changes, every control tick (what each
@@ -1608,11 +1608,11 @@ async def _dock_offaxis_fix(learner):
     _dock_set("offaxis", "3-point correction: (A) point the tail at the dock")
     for _ in range(14):
         see = await _dock_settled_look("rear"); tag = see and see.get("tag")
+        _dock_log_tick("offaxis", "A x_err=%s" % (tag and tag["x_err"]))
         if not tag:
             return False
         if abs(tag["x_err"]) <= 0.05:
             break
-        learner.observe(tag["x_err"], True)
         await _dock_pulse_turn(learner.sign() * tag["x_err"], "rear")
     _dock_set("offaxis", "3-point correction: (B) backing toward the dock")
     t0 = time.time()
@@ -1637,6 +1637,7 @@ async def _dock_offaxis_fix(learner):
         if not tag:
             return False
         yaw = tag.get("yaw_deg") or 0.0
+        _dock_log_tick("offaxis", "C yaw=%s" % yaw)
         if abs(yaw) <= 8:
             break
         y0 = yaw
@@ -1668,11 +1669,11 @@ class _SignLearner:
         return _dock["sign"][self.cam]
     def observe(self, err, steered):
         if self.prev is not None and steered:
-            if abs(err) > abs(self.prev) + 0.01:
+            if abs(err) > abs(self.prev) + 0.04:
                 self.bad += 1
             else:
                 self.bad = 0
-            if self.bad >= 3:
+            if self.bad >= 4:
                 _dock["sign"][self.cam] *= -1; self.bad = 0
                 logger.warning("dock: %s steering sign flipped to %+d (error kept growing)", self.cam, int(_dock["sign"][self.cam]))
                 _docklog_event("sign_flip", "%s steering sign → %+d" % (self.cam, int(_dock["sign"][self.cam])))
@@ -1862,7 +1863,7 @@ async def _dock_stage_turn():
 
 async def _dock_stage_back():
     """Rear cam (mirrored), reversing onto the mat until the wheels stall."""
-    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None; last_close = None; reseats = 0
+    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None; last_close = None; reseats = 0; yaw_prev = 0.0; offaxis_n = 0
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -1875,8 +1876,13 @@ async def _dock_stage_back():
             # error = where the dock axis crosses our path: lateral offset, plus the yaw we're
             # carrying - but only once the tag is big enough for the pose yaw to be stable
             # (flight log: at 45 px it flip-flopped +-30 deg every tick and made the rover fishtail)
+            yaw_now = tag.get("yaw_deg", 0.0) or 0.0
+            if abs(yaw_now - yaw_prev) > 20:          # ★ run 10: a single -24° glitch flipped the steering for a tick
+                yaw_now = yaw_prev
+            yaw_prev = yaw_now
             yaw_w = 0.8 if tag["side_px"] >= DOCK["yaw_min_px"] else 0.0
-            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * yaw_w))
+            x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(yaw_now) * yaw_w))
+            offaxis_n = offaxis_n + 1 if abs(tag["x_m"]) > 0.15 else 0
             ref = "tag %.2fm lat %+.2f yaw %+d°" % (tag["z_m"], tag["x_m"], tag.get("yaw_deg", 0))
             last_close = (tag["z_m"], tag["x_m"])
         elif tag:
@@ -1920,7 +1926,7 @@ async def _dock_stage_back():
             continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
-        if tag and tag.get("z_m") is not None and tag.get("x_m") is not None and tag["z_m"] < 0.80 and abs(tag["x_m"]) > 0.10 and reseats < DOCK["reseat_max"]:
+        if tag and tag.get("z_m") is not None and tag.get("x_m") is not None and tag["z_m"] < 0.80 and offaxis_n >= 3 and reseats < DOCK["reseat_max"]:
             # off the dock axis close in: a differential rover cannot crab - do the 3-point correction
             reseats += 1
             _dock_set("reseat", "%.0f cm off the dock axis at %.2f m - 3-point correction (%d/%d)" % (abs(tag["x_m"]) * 100, tag["z_m"], reseats, DOCK["reseat_max"]))
