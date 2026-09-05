@@ -1106,7 +1106,7 @@ DOCK = {
     "sheet_floor_y": float(os.getenv("DOCK_SHEET_FLOOR_Y", "0.70")),   # small blobs below this line are floor clutter, not the sheet
     "sheet_ceiling_y": float(os.getenv("DOCK_SHEET_CEILING_Y", "0.18")),   # blobs above this line are lights, not the sheet
     # final approach (Cap: "rolling back very slowly until it receives charge - that's when it knows it's arrived")
-    "final_z_m": float(os.getenv("DOCK_FINAL_Z_M", "0.32")),        # tag lost inside this range -> blind final roll
+    "final_z_m": float(os.getenv("DOCK_FINAL_Z_M", "0.60")),        # ★ run 15: with the real 76° lens the tag leaves the rear frame at ~0.46 m - that IS the hand-off
     "rev_final": float(os.getenv("DOCK_REV_FINAL", "0.07")),
     "final_max_s": float(os.getenv("DOCK_FINAL_MAX_S", "10")),      # blind roll cap
     "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "150")), # wait for a battery rise before re-seating
@@ -1114,7 +1114,7 @@ DOCK = {
     "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
     # Cap, run 6: "almost - off center just slightly; it must be perfectly centered to charge, and it should
     #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
-    "final_lat_m": float(os.getenv("DOCK_FINAL_LAT_M", "0.035")),   # lateral offset allowed before the final seat
+    "final_lat_m": float(os.getenv("DOCK_FINAL_LAT_M", "0.06")),    # lateral offset allowed before the final seat (the seat marks steer the rest)
     "final_yaw_deg": float(os.getenv("DOCK_FINAL_YAW_DEG", "6")),
     "reseat_m": float(os.getenv("DOCK_RESEAT_M", "0.35")),           # pull forward this far to try again
     "reseat_max": int(os.getenv("DOCK_RESEAT_MAX", "3")),
@@ -1913,6 +1913,11 @@ async def _dock_stage_back():
         if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"] and abs(last_close[1]) <= DOCK["final_lat_m"]:
             # the tag just slid out of view while we were close and CENTERED - that IS the last stretch
             return await _dock_final(last_close[0])
+        if x_err is None and fr and dock_seat(fr.jpeg):
+            # ★ run 15 (Cap: "it switched to the front camera at the last minute and ruined it"): the sheet was
+            #   filling the rear frame - we were AT the stand - and the code went sweeping. Seat marks in view
+            #   means finish, never search.
+            return await _dock_final((last_close or (DOCK["final_z_m"], 0.0))[0])
         if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"]:
             # close, but the last good look said we were off-center: pull forward and re-seat
             if reseats < DOCK["reseat_max"]:
