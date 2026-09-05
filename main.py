@@ -1080,6 +1080,7 @@ async def audio_feed():
 #   mat rails for the last stretch → DOCKED when the wheels stall against the
 #   stand. Lost marker → stop, slow search turn, give up. Manual drive or
 #   ALL STOP aborts. Every tunable is a DOCK_* env var.
+import base64  # noqa: E402
 import math  # noqa: E402
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -1115,9 +1116,54 @@ DOCK = {
     "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.40")), "search_s": float(os.getenv("DOCK_SEARCH_S", "25")),
     "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
+    # ★ Sep 5 (Cap: "it's trying to find the image while moving which causes blur"):
+    #   turns and searches PULSE — rotate, stop, settle, look — and a lost marker
+    #   is only declared lost from a settled (stopped) frame.
+    "pulse_s": float(os.getenv("DOCK_PULSE_S", "0.5")),          # rotate this long per pulse
+    "settle_s": float(os.getenv("DOCK_SETTLE_S", "0.45")),        # stop this long before looking
     "front_sign": float(os.getenv("DOCK_FRONT_SIGN", "-1")),   # angular = sign * x_err * gain  (front cam, forward)
     "rear_sign": float(os.getenv("DOCK_REAR_SIGN", "1")),      # rear cam (raw/mirrored frame), reversing
 }
+# ★ Sep 5, 2026 (Cap: "create a diagnostic download so you can see the events").
+#   Every run keeps a flight log: phase changes, every control tick (what each
+#   camera saw, the command sent, heading, wheel state), the learned mirror/sign
+#   values, the tunables in force, and small JPEG snapshots at each phase change.
+#   GET /dock/log returns the last run as JSON (Connect proxies it as a download).
+_docklog = {"run_id": None, "started_at": None, "events": [], "ticks": [], "snaps": [], "config": None}
+_DOCKLOG_MAX_TICKS = 3000
+_DOCKLOG_MAX_SNAPS = 16
+def _docklog_reset():
+    _docklog.update({"run_id": time.strftime("%Y%m%d-%H%M%S"), "started_at": time.time(), "events": [], "ticks": [], "snaps": [], "config": dict(DOCK)})
+def _docklog_event(kind, text, extra=None):
+    e = {"t": round(time.time() - (_docklog["started_at"] or time.time()), 2), "kind": kind, "text": text}
+    if extra: e.update(extra)
+    _docklog["events"].append(e)
+def _docklog_tick(stage, cam, see, linear, angular, note=None):
+    if len(_docklog["ticks"]) >= _DOCKLOG_MAX_TICKS:
+        return
+    tag = see and see.get("tag"); sheet = see and see.get("sheet"); d = telemetry_hub.latest or {}
+    _docklog["ticks"].append({
+        "t": round(time.time() - (_docklog["started_at"] or time.time()), 2), "stage": stage, "cam": cam,
+        "cmd": [round(linear, 3), round(angular, 3)],
+        "tag": ({k: tag.get(k) for k in ("x_err", "side_px", "x_m", "z_m", "yaw_deg", "stage_bearing_deg", "stage_dist_m", "mirrored")} if tag else None),
+        "sheet": ({k: sheet.get(k) for k in ("x_err", "ratio", "cy")} if sheet else None),
+        "lane_err": see.get("lane_err") if see else None,
+        "hdg": _dock_heading(), "rpms0": _dock_rpms_zero(), "bat": d.get("battery"), "spd": d.get("speed"), "note": note,
+    })
+def _docklog_snap(label, jpeg):
+    if not jpeg or len(_docklog["snaps"]) >= _DOCKLOG_MAX_SNAPS:
+        return
+    try:
+        img = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        h, w = img.shape[:2]; sm = cv2.resize(img, (320, int(h * 320.0 / w)))
+        ok, enc = cv2.imencode(".jpg", sm, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        if ok:
+            _docklog["snaps"].append({"t": round(time.time() - (_docklog["started_at"] or time.time()), 2), "label": label, "jpeg_b64": base64.b64encode(enc.tobytes()).decode()})
+    except Exception:
+        pass
+
 _dock = {"task": None, "state": "idle", "phase": None, "since": None, "reason": None, "sense": None,
          "started_at": None, "last_seen": None, "cmds": 0, "cam": None,
          "mirror": {"front": None, "rear": None}, "sign": {"front": DOCK["front_sign"], "rear": DOCK["rear_sign"], "spin": 1.0}}
@@ -1243,6 +1289,7 @@ def dock_see(jpeg: bytes, cam: str):
             t["x_err"] = round(t["cx"] - 0.5, 3); t["mirrored"] = flipped
             if _dock["mirror"].get(cam) is None:
                 _dock["mirror"][cam] = flipped; logger.info("dock: %s camera is %s", cam, "MIRRORED" if flipped else "not mirrored")
+                _docklog_event("mirror", "%s camera is %s" % (cam, "MIRRORED" if flipped else "not mirrored"))
             out["tag"] = t
             break
     # magenta sheet: purple-magenta blobs above the floor line
@@ -1312,6 +1359,7 @@ async def _dock_send(linear: float, angular: float):
     cmd = {"linear": round(linear, 3), "angular": round(angular, 3), "lamp": 0}
     arm_control_watchdog(cmd)
     _dock["cmds"] += 1
+    _dock["_last_cmd"] = (cmd["linear"], cmd["angular"])
     try:
         await _dispatch_browser_control(cmd)
     except Exception as e:
@@ -1322,6 +1370,8 @@ def _dock_set(phase, reason=None):
     if _dock["phase"] != phase:
         _dock["phase"] = phase; _dock["since"] = time.time()
         logger.info("dock: %s%s", phase, (" — " + reason) if reason else "")
+        _docklog_event("phase", phase + ((" — " + reason) if reason else ""), {"cam": _dock.get("cam"), "state": _dock.get("state")})
+        _dock["_snap_wanted"] = phase
     if reason:
         _dock["reason"] = reason
 
@@ -1329,10 +1379,39 @@ def _dock_set(phase, reason=None):
 async def _dock_frame(cam: str):
     b = feed_broadcasters[cam]
     try:
-        return await b.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
+        fr = await b.get_frame(max_age=0.4, timeout=2.0, fps=int(DOCK["hz"]))
     except Exception as e:
         logger.warning("dock: %s frame error: %s", cam, e)
-        return None
+        _docklog_event("frame_error", cam + ": " + str(e)[:100]); return None
+    if fr is None:
+        _docklog_event("frame_error", cam + ": no frame")
+    _dock["_last_frame"] = (cam, fr.jpeg if fr else None)
+    return fr
+
+
+async def _dock_settled_look(cam: str):
+    """Stop, let the camera settle, take a FRESH frame, and sense it."""
+    await _dock_send(0, 0)
+    await asyncio.sleep(DOCK["settle_s"])
+    b = feed_broadcasters[cam]
+    try:
+        fr = await b.get_frame(max_age=0.15, timeout=2.0, fps=int(DOCK["hz"]))
+    except Exception as e:
+        _docklog_event("frame_error", cam + " (settled): " + str(e)[:100]); fr = None
+    _dock["_last_frame"] = (cam, fr.jpeg if fr else None)
+    see = dock_see(fr.jpeg, cam) if fr else None
+    _dock["sense"] = see; _dock["cam"] = cam
+    return see
+
+
+def _dock_log_tick(stage, note=None):
+    """Called once per control-loop iteration by the stages (after the send)."""
+    cam, jpeg = _dock.get("_last_frame", (None, None))
+    lin, ang = _dock.get("_last_cmd", (0, 0))
+    _docklog_tick(stage, cam, _dock.get("sense"), lin, ang, note)
+    want = _dock.pop("_snap_wanted", None)
+    if want and jpeg:
+        _docklog_snap(want + " (" + str(cam) + ")", jpeg)
 
 
 class _SignLearner:
@@ -1350,6 +1429,7 @@ class _SignLearner:
             if self.bad >= 4:
                 _dock["sign"][self.cam] *= -1; self.bad = 0
                 logger.warning("dock: %s steering sign flipped to %+d (error kept growing)", self.cam, int(_dock["sign"][self.cam]))
+                _docklog_event("sign_flip", "%s steering sign → %+d" % (self.cam, int(_dock["sign"][self.cam])))
         self.prev = err
 
 
@@ -1376,16 +1456,20 @@ async def _dock_stage_approach():
             await _dock_send(0, 0); _dock_set("staged", "tag %dpx (no pose) — turning" % tag["side_px"]); return True
         tgt = tag or sheet
         if not tgt:
+            # a moving frame said nothing — stop and look before believing it
+            see = await _dock_settled_look("front"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); tgt = tag or sheet
+        if not tgt:
             if _dock["last_seen"] is None:
                 _dock["last_seen"] = now
             lost = now - _dock["last_seen"]
-            if lost < 1.5:
-                await _dock_send(0, 0); _dock_set("lost", "dock not in view (front)")
-            elif lost < 1.5 + DOCK["search_s"]:
-                _dock_set("search", "turning to find the dock"); await _dock_send(0, DOCK["search_turn"] * search_dir)
+            if lost < 1.0:
+                _dock_set("lost", "dock not in view (front)")
+            elif lost < 1.0 + DOCK["search_s"]:
+                _dock_set("search", "turning to find the dock"); await _dock_send(0, DOCK["search_turn"] * search_dir); await asyncio.sleep(DOCK["pulse_s"])
             else:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "could not find the dock"); return False
             faced_since = None
+            _dock_log_tick("approach", "lost/search")
             await asyncio.sleep(1.0 / DOCK["hz"]); continue
         _dock["last_seen"] = now
         # ---- with a pose: navigate to the staging point, then square up ----
@@ -1417,6 +1501,7 @@ async def _dock_stage_approach():
                     else:
                         await _dock_send(0, angular); _dock_set("face", "facing the dock · %+d%%" % int(x_err * 100))
                     learner.observe(x_err, True)
+            _dock_log_tick("approach")
             await asyncio.sleep(1.0 / DOCK["hz"]); continue
         # ---- no pose (sheet only, or tag without pose): bearing-only approach ----
         x_err = tgt["x_err"]; search_dir = 1.0 if x_err < 0 else -1.0
@@ -1445,15 +1530,15 @@ async def _dock_stage_turn():
         if time.time() - t0 > DOCK["spin_timeout_s"]:
             await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_timeout", "spun for %ds without the rear camera finding the dock" % DOCK["spin_timeout_s"]); return False
         await _dock_send(0, DOCK["spin"] * sign)
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(DOCK["pulse_s"])
+        see = await _dock_settled_look("rear")          # stop · settle · look (no motion blur)
         h = _dock_heading()
         if h is not None and hp is not None:
             d = ((h - hp + 540.0) % 360.0) - 180.0; turned += abs(d); hp = h
-        fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None
-        _dock["sense"] = see; _dock["cam"] = "rear"
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
         hit = (tag and abs(tag["x_err"]) < 0.22) or (sheet and abs(sheet["x_err"]) < 0.18 and sheet["ratio"] >= 0.03)
         _dock_set("turn", "180° — turned ~%d°, rear cam: %s" % (turned, "TAG" if tag else "sheet" if sheet else "nothing yet"))
+        _dock_log_tick("turn", "turned~%d" % turned)
         if hit:
             await _dock_send(0, 0); _dock_set("turned", "rear camera has the dock (~%d° turned)" % turned); return True
         if turned > 400:
@@ -1484,21 +1569,32 @@ async def _dock_stage_back():
         else:
             x_err = None; ref = None
         if x_err is None:
+            see = await _dock_settled_look("rear"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
+            if tag and tag.get("x_m") is not None and tag.get("z_m"):
+                x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * 0.8)); ref = "tag %.2fm (settled)" % tag["z_m"]
+            elif tag:
+                x_err = tag["x_err"]; ref = "tag %dpx (settled)" % tag["side_px"]
+            elif sheet and sheet["ratio"] >= DOCK["min_ratio"]:
+                x_err = sheet["x_err"]; ref = "sheet (settled)"
+            elif lane is not None:
+                x_err = lane; ref = "rails (settled)"
+        if x_err is None:
             if _dock["last_seen"] is None:
                 _dock["last_seen"] = now
             lost = now - _dock["last_seen"]
-            if lost < 1.5:
-                await _dock_send(0, 0); _dock_set("lost", "dock not in view (rear)")
-            elif lost < 1.5 + DOCK["search_s"]:
+            if lost < 1.0:
+                _dock_set("lost", "dock not in view (rear)")
+            elif lost < 1.0 + DOCK["search_s"]:
                 # is the dock in FRONT of us? then the turn didn't take — go around again
                 if int(lost * 2) % 4 == 0:
                     ffr = await _dock_frame("front"); fsee = dock_see(ffr.jpeg, "front") if ffr else None
                     if fsee and (fsee.get("tag") or (fsee.get("sheet") and fsee["sheet"]["ratio"] >= 0.03)):
                         await _dock_send(0, 0); _dock_set("turn_again", "dock is in front of us — turning around again"); return "turn"
-                _dock_set("search", "turning to find the dock (rear)"); await _dock_send(0, DOCK["search_turn"] * search_dir)
+                _dock_set("search", "turning to find the dock (rear)"); await _dock_send(0, DOCK["search_turn"] * search_dir); await asyncio.sleep(DOCK["pulse_s"])
             else:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "lost the dock while backing in"); return False
             rev_since = None
+            _dock_log_tick("back", "lost/search")
             await asyncio.sleep(1.0 / DOCK["hz"]); continue
         _dock["last_seen"] = now
         search_dir = 1.0 if x_err < 0 else -1.0
@@ -1516,11 +1612,14 @@ async def _dock_stage_back():
                 await _dock_send(0, 0); _dock["state"] = "docked"; _dock_set("docked", "wheels stalled against the stand"); return True
         learner.observe(x_err, angular != 0.0)
         await _dock_send(linear, angular)
+        _dock_log_tick("back", ref)
         await asyncio.sleep(1.0 / DOCK["hz"])
 
 
 async def _dock_loop():
     _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None})
+    _docklog_reset()
+    _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
     try:
         if not await browser_service.has_rear_camera():
@@ -1550,6 +1649,9 @@ async def _dock_loop():
         except Exception:
             pass
         _dock["state"] = "failed"; _dock_set("error", str(e)[:120])
+    finally:
+        _docklog_event("end", "run ended: " + str(_dock.get("state")) + (" — " + str(_dock.get("reason")) if _dock.get("reason") else ""),
+                       {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "cmds": _dock["cmds"]})
 
 
 def _dock_active() -> bool:
@@ -1576,6 +1678,15 @@ def _dock_status():
 @app.get("/dock")
 async def dock_get():
     return _dock_status()
+
+
+@app.get("/dock/log")
+async def dock_log(snaps: int = 1):
+    """Flight log of the last self-dock run (see _docklog)."""
+    out = {"run_id": _docklog["run_id"], "generated_at": time.time(), "state": _dock_status(), "config": _docklog["config"],
+           "events": _docklog["events"], "ticks": _docklog["ticks"], "snaps": _docklog["snaps"] if snaps else [],
+           "bot": {"slug": os.getenv("BOT_SLUG"), "type": (auth_response_data or {}).get("BOT_TYPE")}}
+    return JSONResponse(content=out)
 
 
 @app.post("/dock")
