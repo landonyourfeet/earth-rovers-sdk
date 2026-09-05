@@ -1655,7 +1655,7 @@ async def _dock_stage_turn():
 
 async def _dock_stage_back():
     """Rear cam (mirrored), reversing onto the mat until the wheels stall."""
-    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None; last_close = None
+    learner = _SignLearner("rear"); search_dir = 1.0; rev_since = None; last_close = None; reseats = 0
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -1680,9 +1680,17 @@ async def _dock_stage_back():
             x_err = lane; ref = "rails"
         else:
             x_err = None; ref = None
-        if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"] and abs(last_close[1]) <= 0.12:
-            # the tag just slid out of view while we were close and aligned - that IS the last stretch
+        if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"] and abs(last_close[1]) <= DOCK["final_lat_m"]:
+            # the tag just slid out of view while we were close and CENTERED - that IS the last stretch
             return await _dock_final(last_close[0])
+        if x_err is None and last_close and last_close[0] <= DOCK["final_z_m"]:
+            # close, but the last good look said we were off-center: pull forward and re-seat
+            if reseats < DOCK["reseat_max"]:
+                reseats += 1
+                _dock_set("reseat", "off-center by %.0f cm at the stand - pulling forward to re-seat (%d/%d)" % (abs(last_close[1]) * 100, reseats, DOCK["reseat_max"]))
+                await _dock_send(DOCK["fwd_near"], 0.0); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                last_close = None; rev_since = None; _dock["last_seen"] = None
+                continue
         if x_err is None:
             see = await _dock_settled_look("rear"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
             if tag and tag.get("x_m") is not None and tag.get("z_m"):
@@ -1707,10 +1715,11 @@ async def _dock_stage_back():
         search_dir = 1.0 if x_err < 0 else -1.0
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
         angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
+        tol = DOCK["center_tol"] * (0.6 if near else 1.0)   # tighter as the stand gets close
         if abs(x_err) > DOCK["turn_only"] and not near:
             linear = 0.0; _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
         else:
-            if abs(x_err) < DOCK["center_tol"]:
+            if abs(x_err) < tol:
                 angular = 0.0
             linear = -(DOCK["rev_near"] if near else DOCK["rev"])
             _dock_set("back", "backing onto the mat · " + ref)
@@ -1762,7 +1771,14 @@ async def _dock_final(z_from: float):
                 _dock_set("nudge", "no charge after %ds - one more push" % DOCK["charge_wait_s"])
                 await _dock_send(-DOCK["rev_final"], 0.0); await asyncio.sleep(DOCK["nudge_s"]); await _dock_send(0, 0)
                 tw = time.time(); b0 = _dock_battery(); continue
-            _dock["state"] = "docked_nocharge"; _dock_set("no_charge", "on the stand but the battery is not rising - check the pads"); return False
+            # still no charge: on the stand but the coils are not lined up - back off and dock again
+            if _dock.get("_reseat_runs", 0) < DOCK["reseat_max"]:
+                _dock["_reseat_runs"] = _dock.get("_reseat_runs", 0) + 1
+                _dock_set("reseat", "no charge after the wait - re-docking (%d/%d)" % (_dock["_reseat_runs"], DOCK["reseat_max"]))
+                await _dock_send(DOCK["fwd_near"], 0.0); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                _dock["last_seen"] = None
+                return await _dock_stage_back()
+            _dock["state"] = "docked_nocharge"; _dock_set("no_charge", "on the stand but the battery is not rising after %d re-seats - check the pads" % DOCK["reseat_max"]); return False
 
 
 # ★ OKCREAL (Sep 5, 2026 — Cap: "how we make the system automatically return to
@@ -2001,7 +2017,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
