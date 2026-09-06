@@ -1118,6 +1118,11 @@ DOCK = {
     "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "150")), # wait for a battery rise before re-seating
     "nudge_s": float(os.getenv("DOCK_NUDGE_S", "0.8")),             # extra push if no charge after the wait
     "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
+    # ★ Sep 6 (measured on the live feed, rover dead straight): tag 68 px @0.93 m read yaw +2.5°; the same
+    #   rover at 37 px @1.69 m read -8.5/-18.7/-25/-2.8/-20.7° in six seconds. solvePnP on a small square is
+    #   dominated by corner quantisation, so the yaw noise goes as 1/size: roughly K/side_px degrees.
+    "yaw_noise_k": float(os.getenv("DOCK_YAW_NOISE_K", "900")),
+    "yaw_runway_noise": float(os.getenv("DOCK_YAW_RUNWAY_NOISE", "4")),
     # Cap, run 6: "almost - off center just slightly; it must be perfectly centered to charge, and it should
     #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
     "final_lat_m": float(os.getenv("DOCK_FINAL_LAT_M", "0.06")),    # lateral offset allowed before the final seat (the seat marks steer the rest)
@@ -1154,23 +1159,17 @@ DOCK = {
     "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "76")),   # run 14: rear read 0.32 m where the front had just staged at 0.69 m → same ~76° lens
     "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
-    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # ★ 10:56 PM: back to the tolerance that DOCKED this afternoon (runs 15-17); the rear stage fixes the rest
-    # ★ 10:56 PM (Cap: "drives forward, realizes it's wrong, backs up, makes it worse, three times, then ramps
-    #   the dock"). The axis/dogleg/go-around machinery loops on its own noise. It is now OFF by default:
-    #   the approach is the one that docked this afternoon - straight in, turn at two feet, back in, and let
-    #   the rear camera correct small offsets. The manoeuvring only wakes up for a GROSS angle (DOCK_AXIS_ONLY_ABOVE).
-    "axis_mode": os.getenv("DOCK_AXIS_MODE", "simple"),              # simple | full
-    "axis_only_above": float(os.getenv("DOCK_AXIS_ONLY_ABOVE", "28")),
-    # Tag-pose yaw noise scales with tag size: at 37 px it swung -8/-19/-25/-3/-21° in six seconds while the
-    # rover sat dead straight. Yaw inside DOCK_YAW_NOISE_K / side_px is treated as ZERO, and any manoeuvre
-    # needs three consecutive readings outside that band. Unmeasurable = straight in, never "assume crooked".
-    "yaw_noise_k": float(os.getenv("DOCK_YAW_NOISE_K", "900")),
+    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "8")),         # ★ Cap (run 18): only turn around when STRAIGHT ON with the tag
     "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
     "axis_align_max": int(os.getenv("DOCK_AXIS_ALIGN_MAX", "6")),
     # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
     #   system is messing with the tires." All axis work happens OUT HERE: crab legs only run beyond
     #   DOCK_AXIS_WORK_M, and a rover that is closer than that with yaw still on it RETREATS first.
     "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "1.5")),      # the FINAL APPROACH FIX: on the dock axis, this far out (mat lines readable here)
+    # ★ Sep 6: when the runway lines are NOT readable the only yaw we have is the tag pose, and the tag
+    #   stops being measurable past ~1 m (60 px, from px x z ~ 63 measured on the live feed). Backing out
+    #   to 1.5 m to square up would throw away the very measurement we are backing out to use.
+    "axis_work_tag_m": float(os.getenv("DOCK_AXIS_WORK_TAG_M", "1.05")),
     "final_go_around_lat": float(os.getenv("DOCK_GO_AROUND_LAT", "0.12")),   # off the localizer on final → go around
     # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
     #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
@@ -1628,6 +1627,48 @@ def _dock_heading():
         return None
 
 
+def _yaw_noise_deg(side_px):
+    """Degrees of tag-pose yaw that are pure noise at this tag size. Inside this band the number
+    is not a measurement and must never start a manoeuvre."""
+    try:
+        s = float(side_px or 0)
+    except Exception:
+        s = 0.0
+    if s <= 0:
+        return 90.0
+    return max(4.0, min(90.0, DOCK["yaw_noise_k"] / s))
+
+
+def _dock_yaw(see):
+    """The ONLY yaw the docker is allowed to steer on.
+
+    ★ Sep 6 (Cap: "it's lined up pretty straight ... it keeps veering off at the last minute"):
+    the front stage was trusting the tag's pose yaw at any tag size. At the 1.5 m working distance
+    the tag is ~37 px and the pose yaw swings ±25° on a rover that is dead straight - the old ±14°
+    dead band did not cover it. _dock_axis_crab then sized that noise as 47-72 cm beside the axis
+    and doglegged sideways: the dogleg IS the veer.
+
+    Order: the runway centerline (built for exactly this range), else the tag pose but only when the
+    tag is big enough to measure it. Returns (yaw_deg, source, noise_deg) or (None, "unknown", ...).
+    Unknown means DRIVE STRAIGHT IN - it does not mean crooked."""
+    rw = (see or {}).get("runway")
+    if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3 and abs(rw["yaw_deg"]) < 60:
+        return float(rw["yaw_deg"]), "runway", DOCK["yaw_runway_noise"]
+    tag = (see or {}).get("tag")
+    if tag and tag.get("yaw_deg") is not None and (tag.get("side_px") or 0) >= DOCK["yaw_min_px"]:
+        n = _yaw_noise_deg(tag["side_px"]); y = float(tag["yaw_deg"])
+        return (0.0 if abs(y) < n else y), "tag", n
+    return None, "unknown", 90.0
+
+
+def _yaw_solid(hist, yaw_med, noise):
+    """A yaw worth manoeuvring on: several trusted readings, agreeing in sign, outside the noise band."""
+    if len(hist) < 3 or abs(yaw_med) <= noise:
+        return False
+    same = sum(1 for v in hist if (v > 0) == (yaw_med > 0))
+    return same >= max(3, len(hist) - 1)
+
+
 async def _dock_send(linear: float, angular: float):
     # motor dead zone: a small angular command doesn't move the rover at all
     if angular:
@@ -1764,10 +1805,12 @@ async def _dock_retreat(learner, to_m: float):
             break
         ang = 0.0
         if tag and abs(tag["x_err"]) >= 0.05:
-            # ★ 10:46 PM (Cap: "I lined it up straight, it approached, then turned itself away"): this steer was
-            #   inverted "because reversing". Wrong - a positive angular rotates the body the same way whether
-            #   the wheels roll forward or back, so re-centering the tag needs the SAME sign as when driving in.
-            #   With the sign inverted, every retreat swung the rover away from the dock.
+            # ★ Sep 6, straight off the live feed: backing out under this "opposite sense" sign took
+            #   x_err from +0.02 to +0.09 to +0.13 in three ticks - the error grew under correction every
+            #   time. Centring a marker is a BEARING correction, and rotating the body moves the tag across
+            #   the frame the same way whether we are driving forward or backward, so the sign does NOT
+            #   flip. This line was steering the rover off the dock axis during every retreat, and the axis
+            #   code then doglegged to "fix" an offset the retreat had just created.
             ang = max(-0.2, min(0.2, learner.sign() * tag["x_err"] * DOCK["turn_gain"]))
         await _dock_send(-DOCK["fwd_near"], ang)
         _dock_log_tick("retreat", "z=%s" % (tag and tag.get("z_m")))
@@ -1843,8 +1886,8 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
     #   dead center is the yaw / runway sign used - and then a short PROBE leg proves it before the long leg.
     see0 = await _dock_settled_look("front"); tag0 = see0 and see0.get("tag"); rw0 = see0 and see0.get("runway")
     x0 = tag0["x_err"] if tag0 else 0.0
-    side = None
-    if True:
+    side = _dock.get("_crab_side")
+    if side is None:
         # ★ Cap (9:17 PM): "no matter what side I'm on the corrections are the opposite of a human." The tag's
         #   yaw was deciding the side, and at 2 m that number flips sign frame to frame. Humans use the PICTURE:
         #   (a) if the mat is readable, its centerline's near end lies on the side the dock axis runs toward -
@@ -1858,8 +1901,6 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
             _docklog_event("crab", "side from the runway: centerline near end %+.2f vs tag %+.2f → %+d" % (rw0["near_x"], x0, side))
         elif abs(x0) > 0.06:
             side = 1 if x0 > 0 else -1
-        elif _dock.get("_crab_side") is not None:
-            side = _dock["_crab_side"]      # the picture is ambiguous right now: keep the side that worked last time
         else:
             side = 1 if y0 > 0 else -1   # last resort; the probe leg will correct it
     hfov = math.radians(DOCK["hfov_deg"])
@@ -1904,26 +1945,23 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
     # (4) verdict
     ys = []
     for _ in range(3):
-        see = await _dock_settled_look("front"); tag = see and see.get("tag")
-        rw = see and see.get("runway")
-        if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3:
-            ys.append(rw["yaw_deg"])
-        elif tag and tag.get("yaw_deg") is not None:
-            ys.append(tag["yaw_deg"])
-    y1 = sorted(ys)[len(ys) // 2] if ys else y0
-    al1 = see.get("align") if see else None
-    if al1 is not None:
-        # the two-tag test is the judge: the mat tag still on the same side means keep going, flipped means done/overshot
-        _docklog_event("crab", "after the leg: mat tag %+.0f%% off the stand tag" % (al1 * 100))
-        if abs(al1) <= DOCK["win_align"]:
-            _dock["_crab_side"] = side; return 0.0
-        side = 1 if al1 > 0 else -1
-    elif abs(y1) > abs(y0) + 6:
-        # tag-yaw only: flip only on a clear worsening, well outside its noise band
-        side *= -1
-        _docklog_event("crab", "yaw %+d° → %+d°: wrong side, switching" % (y0, y1))
+        see = await _dock_settled_look("front")
+        y, ysrc, _n = _dock_yaw(see)
+        if y is not None:
+            ys.append(y)
+    # ★ Sep 6: this verdict used to accept the raw tag yaw at any size, so at the working distance it
+    #   flipped `side` on noise - the rover doglegged left, then right, then left. No trusted reading
+    #   means no verdict: keep the side we chose from the picture (the two tags / the runway).
+    if not ys:
+        _docklog_event("crab", "no trustworthy yaw after the dogleg - keeping the side chosen from the picture")
+        y1 = y0
     else:
-        _docklog_event("crab", "yaw %+d° → %+d°: keeping this side" % (y0, y1))
+        y1 = sorted(ys)[len(ys) // 2]
+        if abs(y1) > abs(y0) - 2:
+            side *= -1
+            _docklog_event("crab", "yaw %+d° → %+d°: wrong side, switching" % (y0, y1))
+        else:
+            _docklog_event("crab", "yaw %+d° → %+d°: on the right side" % (y0, y1))
     _dock["_crab_side"] = side
     return y1
 
@@ -1966,9 +2004,12 @@ async def _dock_offaxis_fix(learner):
         see = await _dock_settled_look("rear"); tag = see and see.get("tag")
         if not tag:
             return False
-        yaw = tag.get("yaw_deg") or 0.0
-        _dock_log_tick("offaxis", "C yaw=%s" % yaw)
-        if abs(yaw) <= 8:
+        yaw, ysrc, ynoise = _dock_yaw(see)
+        if yaw is None:
+            _dock_log_tick("offaxis", "C yaw not measurable at this tag size - leaving it straight")
+            break
+        _dock_log_tick("offaxis", "C yaw=%s (%s)" % (yaw, ysrc))
+        if abs(yaw) <= max(8.0, ynoise):
             break
         y0 = yaw
         await _dock_pulse_turn(spin * (1 if yaw > 0 else -1), "rear")
@@ -1981,7 +2022,9 @@ async def _dock_offaxis_fix(learner):
         fr = await _dock_frame("rear"); see = dock_see(fr.jpeg, "rear") if fr else None; tag = see and see.get("tag")
         ang = 0.0
         if tag and abs(tag["x_err"]) >= 0.04:
-            ang = max(-0.2, min(0.2, learner.sign() * tag["x_err"] * DOCK["turn_gain"]))   # same sign forward or back
+            # ★ Sep 6: same bearing-sign error as the retreat - and steps (A) and (B) of this very
+            #   manoeuvre already use +learner.sign(). Step (D) was undoing them.
+            ang = max(-0.2, min(0.2, learner.sign() * tag["x_err"] * DOCK["turn_gain"]))
         await _dock_send(DOCK["fwd_near"], ang)
         _dock_log_tick("offaxis", "D")
         await asyncio.sleep(1.0 / DOCK["hz"])
@@ -2070,33 +2113,35 @@ async def _dock_stage_approach():
         _dock["last_seen"] = now
         # ---- with a pose ----
         if tag and tag.get("z_m") is not None:
-            z = tag["z_m"]; yaw = tag.get("yaw_deg", 0.0); x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
+            z = tag["z_m"]; x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
             far_offaxis = False   # the staging-point chase is retired; the crab manoeuvre below handles off-axis
-            # ★ run 21: tag-pose yaw at 2 m is ±15° of noise plus a sign ambiguity - it staged at -29°
-            #   and rode up onto the stand. The runway lines give a yaw that does not flip.
+            # ★ Sep 6 - the veer. Yaw now comes from _dock_yaw() (runway lines, or the tag only when it is
+            #   big enough to measure), it has to clear its own noise band, and it has to be repeatable
+            #   before it is allowed to start a manoeuvre. Lateral offset (x_m) is NOT gated: that one is
+            #   bearing x distance and stays good at any tag size. An unmeasurable yaw means fly straight
+            #   in on the localizer until the tag is big enough to read - it does not mean crooked.
             rw = see.get("runway") if see else None
-            if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3 and abs(rw["yaw_deg"]) < 60:
-                yaw = rw["yaw_deg"]
-                # (the runway's bottom-of-frame offset is NOT a metres number - it stays out of `lat`)
-            # yaw glitch filter: median of the last three readings
-            yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-5]
-            yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
-            runway_ok = bool(rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3)
-            noise = DOCK["yaw_noise_k"] / max(20.0, float(tag.get("side_px") or 20))
-            if not runway_ok:
-                if abs(yaw_med) < max(14.0, noise):
-                    yaw_med = 0.0   # tag-only yaw inside its size-scaled noise band is treated as straight
-                # ...and a real angle must persist: three consecutive readings outside the band
-                outs = _dock.setdefault("_yaw_out_n", 0)
-                _dock["_yaw_out_n"] = outs + 1 if yaw_med != 0.0 else 0
-                if _dock["_yaw_out_n"] < 3:
-                    yaw_med = 0.0
-            axis_trigger = DOCK["axis_align_yaw"] if DOCK["axis_mode"] == "full" else DOCK["axis_only_above"]
-            if abs(yaw_med) > axis_trigger and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
+            if rw and rw.get("lat") is not None and rw.get("vps", 0) >= 3:
+                pass   # (the runway's bottom-of-frame offset is not a metres number - it must not feed the go-around)
+            yaw_raw, yaw_src, yaw_noise = _dock_yaw(see)
+            yaw_known = yaw_raw is not None
+            yaw = yaw_raw if yaw_known else 0.0
+            runway_ok = (yaw_src == "runway")
+            yaw_hist = _dock.setdefault("_yaw_hist", [])
+            if yaw_known:
+                yaw_hist.append(yaw); del yaw_hist[:-5]
+            yaw_med = (sorted(yaw_hist)[len(yaw_hist) // 2] if yaw_hist else 0.0) if yaw_known else 0.0
+            yaw_ok = yaw_known and _yaw_solid(yaw_hist, yaw_med, yaw_noise)
+            if not yaw_ok:
+                yaw_med = 0.0
+            # where axis work happens: Cap's 1.5 m fix when the mat lines carry the yaw, otherwise only as
+            # far out as the tag can still be measured
+            awm = DOCK["axis_work_m"] if runway_ok else DOCK["axis_work_tag_m"]
+            if yaw_ok and abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                 await _dock_send(0, 0)
-                if z < DOCK["axis_work_m"]:
-                    await _dock_retreat(learner, DOCK["axis_work_m"])
+                if z < awm:
+                    await _dock_retreat(learner, awm)
                 _dock_set("axis", "getting onto the dock axis · yaw %+d° · dogleg %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
                 await _dock_axis_crab(learner, yaw_med, z0=z, lat_hint=(rw.get("lat") if rw else None))
                 _dock["_yaw_hist"] = []
@@ -2114,51 +2159,40 @@ async def _dock_stage_approach():
                     # ★ Cap: "an airplane lines up far from the runway, flies final, confirms lined up 2 ft out."
                     #   This is final: the localizer is the dock axis. Drifting off it below 1.2 m is a GO-AROUND -
                     #   back out to the fix and re-fly - never a fudge next to the stand.
-                    # ★ 10:42 PM, Cap: "it still doesn't know what success is." SUCCESS on final = the mat points
-                    #   straight at the camera: the mat's tag sits directly under the stand tag. That is the
-                    #   localizer - checked on EVERY frame where both tags decode, not just at the end.
-                    al = see.get("align") if see else None
-                    lined = ("lined up" if abs(al) <= DOCK["win_align"] else "NOT straight (mat tag %+.0f%% off)" % (al * 100)) if al is not None else "mat tag not readable yet"
-                    if DOCK["axis_mode"] == "full" and al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
-                        _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
-                        _dock_set("go_around", "not straight on final - mat tag %+.0f%% off the stand tag - going around" % (al * 100))
-                        await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"])
-                        await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=DOCK["axis_work_m"], lat_hint=al)
-                        _dock["_yaw_hist"] = []; continue
-                    if DOCK["axis_mode"] == "full" and z < 1.2 and al is None and (abs(yaw_med) > DOCK["yaw_ok_deg"] + 4 or abs(lat) > DOCK["final_go_around_lat"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    if z < 1.2 and ((yaw_ok and abs(yaw_med) > DOCK["yaw_ok_deg"] + 4) or abs(lat) > DOCK["final_go_around_lat"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                         _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                         _dock_set("go_around", "off the localizer on final (yaw %+d°, %+.0f cm) - going around" % (yaw_med, lat * 100))
-                        await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"])
-                        await _dock_axis_crab(learner, yaw_med, z0=DOCK["axis_work_m"], lat_hint=(rw.get("lat") if rw else None))
+                        await _dock_send(0, 0); await _dock_retreat(learner, awm)
+                        await _dock_axis_crab(learner, yaw_med, z0=awm, lat_hint=(rw.get("lat") if rw else None))
                         _dock["_yaw_hist"] = []; continue
                     ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
                     lin = DOCK["fwd_near"] if z < 1.0 else DOCK["fwd"]
-                    _dock_set("final_approach", "on final · %.2f m · %+d%% · %s" % (z, int(x_err * 100), lined))
+                    _dock_set("final_approach", "on final · %.2f m · %+d%% · yaw %s" % (z, int(x_err * 100), ("%+d°" % yaw_med) if yaw_ok else "—"))
                     learner.observe(x_err, ang != 0.0)
                     await _dock_send(lin, ang)
                     _dock_log_tick("approach")
                     await asyncio.sleep(1.0 / DOCK["hz"]); continue
-                if abs(yaw_med) > (DOCK["yaw_ok_deg"] if DOCK["axis_mode"] == "full" else DOCK["axis_only_above"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
-                    # close, centered, but GROSSLY crooked: get right back out to working distance, then crab
+                if yaw_ok and abs(yaw_med) > DOCK["yaw_ok_deg"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    # close, centered, but not straight on: get right back out to working distance, then crab
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "at staging distance but %+d° off axis - backing out to square up" % yaw_med)
-                    await _dock_retreat(learner, DOCK["axis_work_m"])
-                    await _dock_axis_crab(learner, yaw_med, z0=DOCK["axis_work_m"], lat_hint=(rw.get("lat") if rw else None))
+                    await _dock_retreat(learner, awm)
+                    await _dock_axis_crab(learner, yaw_med, z0=awm, lat_hint=(rw.get("lat") if rw else None))
                     _dock["_yaw_hist"] = []
                     continue
                 al = see.get("align") if see else None
-                if DOCK["axis_mode"] == "full" and al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                if al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                     # the picture says NOT straight on (mat tag off to one side of the stand tag): fix it out at working distance
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "not straight on - mat tag %+.0f%% off the stand tag - backing out to square up" % (al * 100))
-                    await _dock_retreat(learner, DOCK["axis_work_m"])
-                    await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=DOCK["axis_work_m"], lat_hint=al)
+                    await _dock_retreat(learner, awm)
+                    await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=awm, lat_hint=al)
                     _dock["_yaw_hist"] = []
                     continue
-                if abs(yaw_med) > DOCK["axis_only_above"]:
+                if yaw_ok and abs(yaw_med) > DOCK["yaw_ok_deg"] and al is None:
                     await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
                 await _dock_send(0, 0)
-                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
+                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %s — turning" % (z, int(x_err * 100), ("%+d°" % yaw_med) if yaw_ok else "not measurable (flying the picture)"))
                 return True
         if tag and tag.get("stage_dist_m") is not None:
             sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
@@ -2236,11 +2270,11 @@ async def _dock_stage_turn():
             #   direction that brought it into view is the direction that centers it; flip only if it
             #   measurably moves away.
             _dock_set("turn", "180° — rear cam has the tag at %+d%%, finishing the turn" % int(tag["x_err"] * 100))
-            # ★ run at 11:05 PM: "keep turning the same way" is right only until the tag crosses center. This
+            # ★ run at 11:05 PM: "keep turning the same way" is right only until the tag crosses center. That
             #   run swept the tag +31 → +26, lost it in blur, kept going, picked it up at -28 on the far side and
             #   kept turning AWAY (-28 → -43 → gone). Now: one pulse in the sweep direction tells us how a pulse
-            #   moves the tag (Δx per direction); after that every pulse is aimed at center from the tag's
-            #   current side, and a lost tag means "back up one pulse and look", never "keep sweeping".
+            #   moves the tag; after that every pulse is aimed at center from the tag's current side, and a
+            #   lost tag means "back up one pulse and look", never "keep sweeping".
             direction = sign; m = None; x_prev = tag["x_err"]
             for _ in range(20):
                 await _dock_send(0, DOCK["spin"] * direction)
@@ -2248,7 +2282,6 @@ async def _dock_stage_turn():
                 see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
                 _dock_log_tick("turn", "centering %+d%% dir %+d" % (int((t2 or tag)["x_err"] * 100), direction))
                 if not t2:
-                    # lost it - step back once and look again
                     await _dock_send(0, -DOCK["spin"] * direction); await asyncio.sleep(DOCK["pulse_turn_s"] * 0.6)
                     see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
                     if not t2:
@@ -2330,7 +2363,12 @@ async def _dock_stage_back():
         if x_err is None:
             see = await _dock_settled_look("rear"); tag = see and see.get("tag"); sheet = see and see.get("sheet"); lane = see and see.get("lane_err")
             if tag and tag.get("x_m") is not None and tag.get("z_m"):
-                x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) + math.radians(tag.get("yaw_deg", 0.0)) * 0.8)); ref = "tag %.2fm (settled)" % tag["z_m"]
+                # ★ Sep 6: this line still carried the pre-run-14 sign (+yaw) and no size gate, so every
+                #   time the tag blinked out close in, the settled re-look steered the OPPOSITE way to the
+                #   main loop above. Identical formula to the primary path now.
+                yaw_s = tag.get("yaw_deg", 0.0) or 0.0
+                yaw_ws = 0.8 if (tag.get("side_px") or 0) >= DOCK["yaw_min_px"] else 0.0
+                x_err = max(-0.5, min(0.5, tag["x_m"] / max(0.3, tag["z_m"]) - math.radians(yaw_s) * yaw_ws)); ref = "tag %.2fm (settled)" % tag["z_m"]
             elif tag:
                 x_err = tag["x_err"]; ref = "tag %dpx (settled)" % tag["side_px"]
             elif sheet and sheet["ratio"] >= DOCK["min_ratio"]:
@@ -2436,8 +2474,10 @@ async def _dock_final(z_from: float):
                 _dock_log_tick("final", "seat pulse dx=%+.2f" % dx)
                 continue
             else:
-                # steering while creeping uses the SAME sign as the centering pulse above (it was inverted:
-                # between 3% and 8% off the marks it pushed itself further off every tick)
+                # ★ Sep 6 - the last inch. This steering sign was the opposite of the seat pulse three
+                #   lines above it, and of the whole back stage. Between 3% and 8% off the marks it pushed
+                #   the rover further off centre every tick, the pulse yanked it back, and it wobbled off
+                #   the coil right at the end. Same sign as everything else now.
                 ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
                 await _dock_send(-DOCK["seat_creep"], ang); moving_cmd = True; _dock_set("final", "seating - creeping to the stand · width %.2f · offset %+.0f%%" % (seat["width"], dx * 100))
         else:
@@ -2755,16 +2795,18 @@ async def _dock_loop():
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
     try:
-        if not await browser_service.has_rear_camera():
-            # the Agora rear track sometimes attaches a few seconds after the front one - wait for it
-            _dock_set("wait", "waiting for the rear camera to attach")
-            ok = False
-            for _ in range(30):
-                await asyncio.sleep(0.5)
-                if await browser_service.has_rear_camera():
-                    ok = True; break
-            if not ok:
-                _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
+        # ★ Sep 6: a run died on "this rover publishes no rear camera" seconds after a run that had it -
+        #   the Agora rear track simply had not attached yet. Wait for it before calling the rover blind.
+        rear_ok = False
+        for _try in range(4):
+            if await browser_service.has_rear_camera():
+                rear_ok = True; break
+            _dock_set("acquire", "waiting for the rear camera track (%d/4)" % (_try + 1))
+            await asyncio.sleep(4.0)
+            with contextlib.suppress(Exception):
+                browser_service._rear_camera = None      # drop the negative cache so the next look is real
+        if not rear_ok:
+            _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
         ap = await _dock_stage_approach()
         if not ap:
             return
