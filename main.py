@@ -1154,7 +1154,7 @@ DOCK = {
     # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
     #   system is messing with the tires." All axis work happens OUT HERE: crab legs only run beyond
     #   DOCK_AXIS_WORK_M, and a rover that is closer than that with yaw still on it RETREATS first.
-    "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "2.0")),      # the FINAL APPROACH FIX: on the dock axis, this far out
+    "axis_work_m": float(os.getenv("DOCK_AXIS_WORK_M", "1.5")),      # the FINAL APPROACH FIX: on the dock axis, this far out (mat lines readable here)
     "final_go_around_lat": float(os.getenv("DOCK_GO_AROUND_LAT", "0.12")),   # off the localizer on final → go around
     # ★ Cap (run 12, watching): "front camera gets close, tag covers the screen, switches cameras, goes sideways."
     #   The sheet-only approach was allowed to run until the sheet was 32% of the frame - with a 110° lens that is
@@ -1214,6 +1214,7 @@ def _docklog_tick(stage, cam, see, linear, angular, note=None):
         "tag": ({k: tag.get(k) for k in ("x_err", "side_px", "x_m", "z_m", "yaw_deg", "stage_bearing_deg", "stage_dist_m", "mirrored")} if tag else None),
         "sheet": ({k: sheet.get(k) for k in ("x_err", "ratio", "cy")} if sheet else None),
         "lane_err": see.get("lane_err") if see else None,
+        "runway": (see.get("runway") if see else None),
         "hdg": _dock_heading(), "rpms0": _dock_rpms_zero(), "bat": d.get("battery"), "v": d.get("voltage"), "i": d.get("current"), "pw": d.get("power"), "spd": d.get("speed"), "note": note,
     })
 def _docklog_snap(label, jpeg):
@@ -1535,7 +1536,9 @@ def dock_runway(jpeg: bytes, cam: str = "front"):
         a, b = max(runs, key=lambda r: r[1] - r[0])
         if b - a >= 6:
             lat = round(float((a + b) / 2.0) / w - 0.5, 3)
-    return {"yaw_deg": round(yaw, 1), "vp_x": round(vx / w - 0.5, 3), "vp_y": round(vy / h, 3), "lat": lat, "lines": len(lines), "vps": len(vps)}
+    # the centerline's near end: the widest dark run in the lowest rows where the mat is present
+    near_x = lat
+    return {"yaw_deg": round(yaw, 1), "vp_x": round(vx / w - 0.5, 3), "vp_y": round(vy / h, 3), "lat": lat, "near_x": near_x, "lines": len(lines), "vps": len(vps)}
 
 
 def dock_led_green(jpeg: bytes):
@@ -1784,14 +1787,21 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
     # ★ Cap (9:08 PM): "it should have made the first move RIGHT but it chose left." The dock was on the
     #   right of the picture. Rule: the first turn is TOWARD the side the dock is on. Only when the tag is
     #   dead center is the yaw / runway sign used - and then a short PROBE leg proves it before the long leg.
-    see0 = await _dock_settled_look("front"); tag0 = see0 and see0.get("tag")
+    see0 = await _dock_settled_look("front"); tag0 = see0 and see0.get("tag"); rw0 = see0 and see0.get("runway")
     x0 = tag0["x_err"] if tag0 else 0.0
     side = _dock.get("_crab_side")
     if side is None:
-        if abs(x0) > 0.08:
+        # ★ Cap (9:17 PM): "no matter what side I'm on the corrections are the opposite of a human." The tag's
+        #   yaw was deciding the side, and at 2 m that number flips sign frame to frame. Humans use the PICTURE:
+        #   (a) if the mat is readable, its centerline's near end lies on the side the dock axis runs toward -
+        #   that is the side to move to; (b) otherwise the side the dock sits on in the frame. Never the yaw.
+        if rw0 and rw0.get("near_x") is not None and rw0.get("vps", 0) >= 3 and abs(rw0["near_x"] - x0) > 0.04:
+            side = 1 if rw0["near_x"] > x0 else -1
+            _docklog_event("crab", "side from the runway: centerline near end %+.2f vs tag %+.2f → %+d" % (rw0["near_x"], x0, side))
+        elif abs(x0) > 0.06:
             side = 1 if x0 > 0 else -1
         else:
-            side = (1 if lat_hint > 0 else -1) if (lat_hint is not None and abs(lat_hint) > 0.03) else (1 if y0 > 0 else -1)
+            side = 1 if y0 > 0 else -1   # last resort; the probe leg will correct it
     hfov = math.radians(DOCK["hfov_deg"])
     # (1) turn out: measure the ROTATION by how far the tag moved in the frame, not where it ended up
     x_out = x0; turned = 0.0
@@ -1996,8 +2006,11 @@ async def _dock_stage_approach():
                 if rw.get("lat") is not None:
                     lat = rw["lat"] * max(0.5, z)   # bottom-of-frame offset scaled to metres-ish
             # yaw glitch filter: median of the last three readings
-            yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-3]
+            yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-5]
             yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
+            runway_ok = bool(rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3)
+            if not runway_ok and abs(yaw_med) < 14:
+                yaw_med = 0.0   # tag-only yaw inside its own noise band is treated as straight
             if abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                 await _dock_send(0, 0)
