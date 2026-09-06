@@ -1138,7 +1138,8 @@ DOCK = {
     "fix_m": float(os.getenv("DOCK_FIX_M", "2.0")),                  # ★ Cap (Sep 6): the fix is 2 m; nothing gets closer unless lined up there
     "fix_side_px": float(os.getenv("DOCK_FIX_SIDE_PX", "0")),        # captured tag size at the fix (0 = derive from fix_m)
     "fix_phi_deg": float(os.getenv("DOCK_FIX_PHI_DEG", "3")),        # square to the wall within this at the fix
-    "fix_lat_m": float(os.getenv("DOCK_FIX_LAT_M", "0.10")),         # on the axis within this at the fix
+    "fix_lat_m": float(os.getenv("DOCK_FIX_LAT_M", "0.25")),         # on the axis within this at the fix (what the optics resolve at 2.5 m; 0.10 demanded 3% of frame from a 5-8% acquire)
+    "min_leg_m": float(os.getenv("DOCK_MIN_LEG_M", "0.5")),          # a planned leg shorter than this is a TRIM for final, never a manoeuvre
     "yaw_runway_noise": float(os.getenv("DOCK_YAW_RUNWAY_NOISE", "4")),
     # Cap, run 6: "almost - off center just slightly; it must be perfectly centered to charge, and it should
     #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
@@ -2003,7 +2004,7 @@ async def _dock_stage_one(learner):
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "sensors disagree at the fix - not going in"); return None
             continue
         # already at the fix?
-        if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.4:
+        if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.6:
             _dock_set("stage1", "at the fix: %.0f cm beside the axis, φ %+.0f° - lined up" % (lat * 100, phi)); return True
         # 3. plan once: turn to face the fix point, drive there, turn to face the wall
         vx, vy = 0.0 - xr, F - yr
@@ -2014,6 +2015,12 @@ async def _dock_stage_one(learner):
         #    the vector to the fix needs -71°; the sign of vx was flipped in this line)
         want = math.degrees(math.atan2(vx, -vy))
         turn1 = ((want - phi + 540) % 360) - 180                                  # right-positive
+        # ★ run 17:22 (straight start, good zero, fix to the centimetre): it planned "turn -93°, drive 0.35 m" to
+        #   chase a 20 cm phantom, knocked itself crooked, and lost the dock. A short leg is not a manoeuvre; it is
+        #   the straight-in final's trim. Pass the gate and let final hold the line.
+        if dist < DOCK["min_leg_m"] and abs(phi) <= DOCK["fix_phi_deg"] * 2:
+            _docklog_event("stage1", "planned leg %.2f m is inside trim range - not manoeuvring; final will hold the line" % dist)
+            _dock_set("stage1", "at the fix (%.0f cm off, φ %+.0f°) - close enough to fly straight" % (lat * 100, phi)); return True
         if dist > 2.5 or abs(lat) > 2.2:
             _docklog_event("stage1", "plan rejected: %.2f m leg / %.2f m beside the axis is not credible from %.2f m range - re-measuring (%d/3)" % (dist, lat, D, attempt + 1))
             if attempt >= 2:
