@@ -2236,21 +2236,32 @@ async def _dock_stage_turn():
             #   direction that brought it into view is the direction that centers it; flip only if it
             #   measurably moves away.
             _dock_set("turn", "180° — rear cam has the tag at %+d%%, finishing the turn" % int(tag["x_err"] * 100))
-            direction = sign
-            for _ in range(16):
+            # ★ run at 11:05 PM: "keep turning the same way" is right only until the tag crosses center. This
+            #   run swept the tag +31 → +26, lost it in blur, kept going, picked it up at -28 on the far side and
+            #   kept turning AWAY (-28 → -43 → gone). Now: one pulse in the sweep direction tells us how a pulse
+            #   moves the tag (Δx per direction); after that every pulse is aimed at center from the tag's
+            #   current side, and a lost tag means "back up one pulse and look", never "keep sweeping".
+            direction = sign; m = None; x_prev = tag["x_err"]
+            for _ in range(20):
                 await _dock_send(0, DOCK["spin"] * direction)
-                await asyncio.sleep(DOCK["pulse_turn_s"])
+                await asyncio.sleep(DOCK["pulse_turn_s"] * (1.0 if abs(x_prev) > 0.2 else 0.5))
                 see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
-                _dock_log_tick("turn", "centering %+d%%" % int((t2 or tag)["x_err"] * 100))
+                _dock_log_tick("turn", "centering %+d%% dir %+d" % (int((t2 or tag)["x_err"] * 100), direction))
                 if not t2:
-                    break
-                if abs(t2["x_err"]) > abs(tag["x_err"]) + 0.04:
-                    direction *= -1; _docklog_event("sign_flip", "turn centering direction → %+d" % int(direction))
-                tag = t2
+                    # lost it - step back once and look again
+                    await _dock_send(0, -DOCK["spin"] * direction); await asyncio.sleep(DOCK["pulse_turn_s"] * 0.6)
+                    see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
+                    if not t2:
+                        break
+                if m is None and abs(t2["x_err"] - x_prev) > 0.02:
+                    m = 1 if (t2["x_err"] - x_prev) * direction > 0 else -1   # +1: this direction moves the tag toward +x
+                tag = t2; x_prev = tag["x_err"]
                 if abs(tag["x_err"]) < 0.08:
                     hit = True; break
-            if hit:
-                _dock["sign"]["rear"] = direction if tag["x_err"] >= 0 else -direction   # what centers a tag on the + side
+                if m is not None:
+                    direction = -m if tag["x_err"] > 0 else m                    # aim the next pulse at center
+            if hit and m is not None:
+                _dock["sign"]["rear"] = -m   # angular sign that brings a +x tag toward center
         _dock_set("turn", "180° — turned ~%d°, rear cam: %s" % (turned, "TAG" if tag else "sheet" if sheet else "nothing yet"))
         _dock_log_tick("turn", "turned~%d" % turned)
         if hit:
