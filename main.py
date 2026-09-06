@@ -1134,7 +1134,7 @@ DOCK = {
     "cam_height_m": float(os.getenv("DOCK_CAM_HEIGHT_M", "0.12")),   # camera lens above the wall-floor junction
     "horizon_y": float(os.getenv("DOCK_HORIZON_Y", "0.5")),          # horizon row as a fraction of frame height (ZERO sets it)
     "wall_q_min": float(os.getenv("DOCK_WALL_Q_MIN", "0.5")),        # RANSAC inlier ratio needed to trust the wall
-    "fix_m": float(os.getenv("DOCK_FIX_M", "2.3")),                  # the fix: this far out on the axis (SET FIX captures the tag size there)
+    "fix_m": float(os.getenv("DOCK_FIX_M", "2.0")),                  # ★ Cap (Sep 6): the fix is 2 m; nothing gets closer unless lined up there
     "fix_side_px": float(os.getenv("DOCK_FIX_SIDE_PX", "0")),        # captured tag size at the fix (0 = derive from fix_m)
     "fix_phi_deg": float(os.getenv("DOCK_FIX_PHI_DEG", "3")),        # square to the wall within this at the fix
     "fix_lat_m": float(os.getenv("DOCK_FIX_LAT_M", "0.10")),         # on the axis within this at the fix
@@ -1173,7 +1173,7 @@ DOCK = {
     #   110° I assumed - every front-camera distance was ~1.8× short. Front and rear now have their own FOV.
     "hfov_deg": float(os.getenv("DOCK_HFOV_DEG", "76")),             # FRONT camera horizontal FOV
     "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "76")),   # run 14: rear read 0.32 m where the front had just staged at 0.69 m → same ~76° lens
-    "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
+    "stage_m": float(os.getenv("DOCK_STAGE_M", "1.0")),             # ★ Cap (Sep 6): turn at ONE metre - at 0.7 m the tail swung into the dock plate
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
     "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "8")),         # ★ Cap (run 18): only turn around when STRAIGHT ON with the tag
     "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
@@ -1958,13 +1958,22 @@ async def _dock_stage_one(learner):
             if t and t.get("z_m") and wl and wl.get("phi") is not None and (wl.get("q") or 0) >= DOCK["wall_q_min"]:
                 reads.append((wl["phi"], bearing(t["x_err"]), t["z_m"], (see.get("xmark") or {}).get("off") if isinstance(see.get("xmark"), dict) else None))
         if len(reads) < 3:
-            _docklog_event("stage1", "wall not measurable (%d good reads) - falling back to the tag approach" % len(reads))
-            return False
+            # Cap: "at no point should it get closer than 2 m unless perfectly lined up." No measurement = no
+            #   permission. Back to the fix distance and try to read again; three misses is an honest failure.
+            _docklog_event("stage1", "wall not measurable here (%d good reads) - backing to the fix and re-acquiring (%d/3)" % (len(reads), attempt + 1))
+            await _dock_retreat(learner, F + 0.3)
+            if attempt >= 2:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "could not measure the wall at the fix - not going in"); return None
+            continue
         phis = sorted(r[0] for r in reads); phi = phis[len(phis) // 2]
         beta = sorted(r[1] for r in reads)[len(reads) // 2]; D = sorted(r[2] for r in reads)[len(reads) // 2]
         xms = [r[3] for r in reads if r[3] is not None]; xm = (sorted(xms)[len(xms) // 2] - _dock.get("xmark_bias", DOCK["xmark_bias"])) if xms else None
         if max(phis) - min(phis) > 8:
-            _docklog_event("stage1", "wall readings disagree (%s) - falling back" % [round(v) for v in phis]); return False
+            _docklog_event("stage1", "wall readings disagree (%s) - re-acquiring (%d/3)" % ([round(v) for v in phis], attempt + 1))
+            await _dock_retreat(learner, F + 0.3)
+            if attempt >= 2:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "wall readings never settled at the fix - not going in"); return None
+            continue
         # rover position: tag direction in world frame is heading + bearing
         a = math.radians(phi + beta)                 # world angle of the tag direction, from "toward the wall", right-positive
         xr = -D * math.sin(a); yr = D * math.cos(a)   # rover position (tag at origin, +y into the room)
@@ -1972,7 +1981,11 @@ async def _dock_stage_one(learner):
         cross = (xm is not None) and ((xm > 0) == (lat > 0))   # X right of the tag ⇔ rover right of the axis
         _docklog_event("stage1", "measured: wall φ %+.1f°, tag bearing %+.1f°, range %.2f m → rover %.2f m beside the axis, %.2f m out%s" % (phi, beta, D, lat, yr, ("; X sight agrees" if xm is not None and cross else ("; X sight DISAGREES (%+.2f)" % xm) if xm is not None else "")))
         if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15:
-            _docklog_event("stage1", "two sensors disagree on the side - not planning on either; falling back"); return False
+            _docklog_event("stage1", "two sensors disagree on the side - not planning on either (%d/3)" % (attempt + 1))
+            await _dock_retreat(learner, F + 0.3)
+            if attempt >= 2:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "sensors disagree at the fix - not going in"); return None
+            continue
         # already at the fix?
         F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
         if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.4:
@@ -2020,18 +2033,21 @@ async def _dock_stage_one(learner):
             if t and t.get("z_m") and wl and wl.get("phi") is not None and (wl.get("q") or 0) >= DOCK["wall_q_min"]:
                 a2 = math.radians(wl["phi"] + bearing(t["x_err"])); ok_reads.append((wl["phi"], -t["z_m"] * math.sin(a2), t["z_m"], t["side_px"], t["x_err"]))
         if len(ok_reads) < 3:
-            _docklog_event("stage1", "could not verify at the fix (wall unreadable) - falling back"); return False
+            _docklog_event("stage1", "could not verify at the fix (wall unreadable) - go-around %d/3" % (attempt + 1))
+            await _dock_retreat(learner, F + 0.3)
+            if attempt >= 2:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "could not verify the line-up at the fix - not going in"); return None
+            continue
         phi2 = sorted(r[0] for r in ok_reads)[len(ok_reads) // 2]; lat2 = sorted(r[1] for r in ok_reads)[len(ok_reads) // 2]
         z2 = sorted(r[2] for r in ok_reads)[len(ok_reads) // 2]; xe2 = sorted(r[4] for r in ok_reads)[len(ok_reads) // 2]
         passed = abs(lat2) <= DOCK["fix_lat_m"] and abs(phi2) <= DOCK["fix_phi_deg"] and abs(xe2) <= 0.03
         _docklog_event("stage1", "verify at the fix: %.0f cm beside the axis, φ %+.1f°, range %.2f m, tag %+.0f%% → %s" % (lat2 * 100, phi2, z2, xe2 * 100, "PASS" if passed else "fail"))
         if passed:
             _dock_set("stage1", "lined up at the fix - handing off to final"); return True
-        _dock_set("stage1", "not lined up at the fix (%.0f cm, φ %+.0f°) - go-around %d/2" % (lat2 * 100, phi2, attempt + 1))
-        if attempt >= 1:
-            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "two go-arounds and still not lined up at the fix - not continuing crooked"); return None
-        # back out to ~3 m before re-flying
-        await _dock_retreat(learner, max(DOCK["fix_m"] + 0.6, 2.8))
+        _dock_set("stage1", "not lined up at the fix (%.0f cm, φ %+.0f°) - go-around %d/3" % (lat2 * 100, phi2, attempt + 1))
+        if attempt >= 2:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "three go-arounds and still not lined up at the fix - not continuing crooked"); return None
+        await _dock_retreat(learner, F + 0.3)
     return None
 
 
@@ -2437,10 +2453,9 @@ async def _dock_stage_approach():
             if not _dock.get("_stage1_done"):
                 await _dock_send(0, 0); _dock["_stage1_done"] = True
                 r1 = await _dock_stage_one(learner)
-                if r1 is None:
+                if not r1:
                     return False
-                if r1:
-                    _dock["_sight_seen"] = True; _dock["_stage1_pass"] = True
+                _dock["_sight_seen"] = True; _dock["_stage1_pass"] = True
                 continue
             if not yaw_ok and z > 1.3 and not _dock.get("_measured_once"):
                 if z > 1.35:
@@ -2537,7 +2552,7 @@ async def _dock_stage_approach():
             #   rover spun in place hunting it, losing the tag three times. Close to the point, the bearing is
             #   meaningless — what matters is being about DOCK_STAGE_M from the tag, facing it, near its axis.
             z = tag.get("z_m") or 0.0
-            near_band = abs(z - DOCK["stage_m"]) <= 0.25 and abs(tag["x_err"]) < 0.22 and abs(yaw) <= DOCK["yaw_ok_deg"] * 1.5
+            near_band = abs(z - DOCK["stage_m"]) <= 0.2 and abs(tag["x_err"]) < 0.22 and abs(yaw) <= DOCK["yaw_ok_deg"] * 1.5
             if sd > DOCK["stage_tol_m"] and not (sd < 0.6 and abs(sb) > 45) and not near_band:
                 # bearing to the staging point drives the steering; forward when roughly pointed at it
                 err = max(-0.5, min(0.5, sb / 60.0))
@@ -2599,7 +2614,10 @@ async def _dock_stage_turn():
         if h is not None and hp is not None:
             d = ((h - hp + 540.0) % 360.0) - 180.0; turned += abs(d); hp = h
         tag = see and see.get("tag"); sheet = see and see.get("sheet")
-        hit = (tag and abs(tag["x_err"]) < 0.08) or (sheet and not tag and abs(sheet["x_err"]) < 0.12 and sheet["ratio"] >= 0.03)
+        # Cap (Sep 6): the 180 ends only when the dock is PERFECTLY lined up in the rear camera - centered, and
+        #   square when the tag is big enough to say (at 1 m it is).
+        rear_square = (not tag) or tag.get("yaw_deg") is None or (tag.get("side_px") or 0) < DOCK["yaw_min_px"] or abs(tag["yaw_deg"]) <= 10
+        hit = (tag and abs(tag["x_err"]) < 0.05 and rear_square) or (sheet and not tag and abs(sheet["x_err"]) < 0.12 and sheet["ratio"] >= 0.03)
         if tag and not hit:
             # ★ Cap (run 9, watching the feed): "as soon as the tag comes into view it stops and starts slowly
             #   turning back the other way, then gets lost." The tag enters from the edge the rotation is
@@ -2626,7 +2644,7 @@ async def _dock_stage_turn():
                 if m is None and abs(t2["x_err"] - x_prev) > 0.02:
                     m = 1 if (t2["x_err"] - x_prev) * direction > 0 else -1   # +1: this direction moves the tag toward +x
                 tag = t2; x_prev = tag["x_err"]
-                if abs(tag["x_err"]) < 0.08:
+                if abs(tag["x_err"]) < 0.05:
                     hit = True; break
                 if m is not None:
                     direction = -m if tag["x_err"] > 0 else m                    # aim the next pulse at center
