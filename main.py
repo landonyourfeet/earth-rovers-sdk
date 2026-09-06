@@ -1095,6 +1095,12 @@ import numpy as np  # noqa: E402
 
 DOCK = {
     "tag_id": int(os.getenv("DOCK_TAG_ID", "7")),
+    "mat_tag_id": int(os.getenv("DOCK_MAT_TAG_ID", "8")),
+    # ★ Cap's three reference frames (Sep 5, 9:29 / 9:31 / 9:34 PM) define what a WIN looks like:
+    #   staged (front) and turned (rear) = the stand tag centered AND the mat's own tag (ID 8) directly
+    #   below it - two markers on the dock axis line up vertically only when the rover is ON the axis;
+    #   docked (rear) = seat stripes 0.70 of the frame apart, center bar at -1%.
+    "win_align": float(os.getenv("DOCK_WIN_ALIGN", "0.03")),        # |x(stand tag) - x(mat tag)| for "straight on"
     # mat rails (red-magenta chevrons): hue 146–158 on camera
     "hue_lo": int(os.getenv("DOCK_HUE_LO", "135")), "hue_hi": int(os.getenv("DOCK_HUE_HI", "180")),
     "sat_min": int(os.getenv("DOCK_SAT_MIN", "60")), "val_min": int(os.getenv("DOCK_VAL_MIN", "60")),
@@ -1125,10 +1131,10 @@ DOCK = {
     #   (values below are as measured by dock_seat() at feed resolution; charged = width 0.633 / cx +0.035,
     #    the two no-charge seats = 0.66-0.67. The margin is thin, so the seat is also CALIBRATED live: Connect
     #    calls /dock calibrate_seat whenever it sees the battery charging, and that measurement wins.)
-    "seat_cx": float(os.getenv("DOCK_SEAT_CX", "0.035")),
+    "seat_cx": float(os.getenv("DOCK_SEAT_CX", "0.06")),
     "seat_cx_tol": float(os.getenv("DOCK_SEAT_CX_TOL", "0.03")),
-    "seat_width": float(os.getenv("DOCK_SEAT_WIDTH", "0.633")),
-    "seat_width_tol": float(os.getenv("DOCK_SEAT_WIDTH_TOL", "0.02")),
+    "seat_width": float(os.getenv("DOCK_SEAT_WIDTH", "1.0")),        # as dock_seat() measures Cap's docked reference frame (bar-only read, lamp on)
+    "seat_width_tol": float(os.getenv("DOCK_SEAT_WIDTH_TOL", "0.06")),
     "seat_creep": float(os.getenv("DOCK_SEAT_CREEP", "0.09")),      # ★ run 16: 0.06 was under the motor dead zone - the wheels "stalled" 20% off center and it called that contact
     # ★ Sep 5 run 3 (console: "APPROACH · FRONT CAM · driving to the dock · sheet 1%" while the dock was
     #   behind the rover): a sheet-only cue must PROVE itself — once it is DOCK_SHEET_CONFIRM wide the tag
@@ -1294,6 +1300,21 @@ def dock_sense(jpeg):
 
 
 
+def _dock_find_mat_tag(gray, w):
+    """The runway's own ArUco (ID 8) at the stand end of the mat. Returns its center x_err or None."""
+    try:
+        corners, ids, _ = _ARUCO_DET.detectMarkers(gray)
+        if ids is None:
+            return None
+        for c, i in zip(corners, ids.ravel()):
+            if int(i) == DOCK.get("mat_tag_id", 8):
+                pts = c.reshape(-1, 2)
+                return round(float(pts[:, 0].mean()) / w - 0.5, 3)
+    except Exception:
+        return None
+    return None
+
+
 def _dock_find_tag(gray, w, cam="front"):
     """Tag corners → bearing, size, and an approximate 3-D pose (metres, camera
     frame: x right, y down, z forward). Intrinsics are estimated from the
@@ -1416,6 +1437,17 @@ def dock_see(jpeg: bytes, cam: str):
             out["runway"] = dock_runway(jpeg, cam)
     except Exception:
         out["runway"] = None
+    # the mat's own tag: lines up under the stand tag only when we are on the axis (lighting-proof, sign-proof)
+    try:
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        flipped = _dock["mirror"].get(cam) is True
+        mx = _dock_find_mat_tag(cv2.flip(g, 1) if flipped else g, w)
+        out["mat_x"] = mx
+        if mx is not None and out.get("tag"):
+            out["align"] = round(mx - out["tag"]["x_err"], 3)          # + → the axis runs to our RIGHT → we are LEFT of it
+            out["win"] = abs(out["align"]) <= DOCK["win_align"] and abs(out["tag"]["x_err"]) <= 0.06
+    except Exception:
+        pass
     return out
 
 
@@ -1428,28 +1460,36 @@ def dock_seat(jpeg: bytes):
         return None
     h, w = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mag = cv2.inRange(hsv, (DOCK["sheet_hue_lo"] - 4, 35, 60), (180, 255, 255))
-    if mag.mean() / 255.0 < 0.15:
-        return None                     # the sheet is not filling the frame - not at the stand
-    dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 95))
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    # --- v2 marks: look in the lower half of the frame for the white band and its three black blocks
-    lower = dark[h // 2:, :]
-    cs, _ = cv2.findContours(lower, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    blobs = []
-    for c in cs:
-        x, y, bw, bh = cv2.boundingRect(c)
-        if bh < 4 or bw < 4 or bw / float(w) > 0.45:
-            continue
-        blobs.append({"cx": (x + bw / 2.0) / w, "cy": (h // 2 + y + bh / 2.0) / h, "w": bw / float(w), "h": bh / float(h), "asp": bw / float(bh)})
-    if len(blobs) >= 3:
-        bars = [b for b in blobs if b["asp"] >= 2.5 and 0.15 <= b["w"] <= 0.45]           # the wide center bar
-        stripes = sorted([b for b in blobs if b["asp"] <= 0.9 and b["w"] <= 0.12], key=lambda b: b["cx"])   # tall thin stripes
-        if bars and len(stripes) >= 2:
-            bar = max(bars, key=lambda b: b["w"])
-            left = min(stripes, key=lambda b: b["cx"]); right = max(stripes, key=lambda b: b["cx"])
-            if right["cx"] - left["cx"] > 0.45 and abs(bar["cx"] - 0.5) < 0.3 and left["cx"] < bar["cx"] < right["cx"]:
-                return {"v": 2, "cx": round(bar["cx"] - 0.5, 3), "width": round(right["cx"] - left["cx"], 3), "bottom_y": round(bar["cy"], 3)}
+    # ★ Cap's docked reference (9:34 PM, lamp on): the magenta reads RED under warm light, so no color gate -
+    #   the seat is read from STRUCTURE: three black blocks on a light band (v2 marks), else the big dark square.
+    # --- v2 marks: the three black blocks in the lower 60% of the frame. Lighting varies a lot (lamp,
+    #     shadow under the stand), so try a few darkness thresholds and take the first that isolates a bar.
+    bars = []; stripes = []; dark = None
+    for thr in (95, 70, 50):
+        dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, thr))
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        lower = dark[int(h * 0.4):, :]
+        cs, _ = cv2.findContours(lower, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        blobs = []
+        for c in cs:
+            x, y, bw, bh = cv2.boundingRect(c)
+            if bh < 4 or bw < 4 or bw / float(w) > 0.48:
+                continue
+            if int(h * 0.4) + y + bh >= h - 2:
+                continue                                   # touching the bottom edge = floor shadow, not a mark
+            blobs.append({"cx": (x + bw / 2.0) / w, "cy": (int(h * 0.4) + y + bh / 2.0) / h, "w": bw / float(w), "h": bh / float(h), "asp": bw / float(bh)})
+        bars = [b for b in blobs if b["asp"] >= 2.0 and 0.10 <= b["w"] <= 0.48 and abs(b["cx"] - 0.5) < 0.3]
+        stripes = sorted([b for b in blobs if b["asp"] <= 1.2 and b["w"] <= 0.14], key=lambda b: b["cx"])
+        if bars:
+            break
+    if bars:
+        bar = min(bars, key=lambda b: abs(b["cy"] - 0.66))       # the center bar sits about two-thirds down the frame at the seat
+        left = [b for b in stripes if b["cx"] < bar["cx"] - 0.15]; right = [b for b in stripes if b["cx"] > bar["cx"] + 0.15]
+        if left and right and (right[-1]["cx"] - left[0]["cx"]) > 0.45:
+            return {"v": 2, "cx": round(bar["cx"] - 0.5, 3), "width": round(right[-1]["cx"] - left[0]["cx"], 3), "bottom_y": round(bar["cy"], 3)}
+        # ★ Cap's docked reference (lamp on, glossy holder): the stripes blow out to white but the 3-inch center
+        #   bar always reads. Bar-only seat: its width x 2.1 lands on the same 0.70 target as the stripe spacing.
+        return {"v": 2, "cx": round(bar["cx"] - 0.5, 3), "width": round(bar["w"] * 2.1, 3), "bottom_y": round(bar["cy"], 3), "bar_only": True}
     # --- v1 fallback: the tag's black square
     cs, _ = cv2.findContours(cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
@@ -1795,7 +1835,11 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         #   yaw was deciding the side, and at 2 m that number flips sign frame to frame. Humans use the PICTURE:
         #   (a) if the mat is readable, its centerline's near end lies on the side the dock axis runs toward -
         #   that is the side to move to; (b) otherwise the side the dock sits on in the frame. Never the yaw.
-        if rw0 and rw0.get("near_x") is not None and rw0.get("vps", 0) >= 3 and abs(rw0["near_x"] - x0) > 0.04:
+        al0 = see0.get("align") if see0 else None
+        if al0 is not None and abs(al0) > 0.015:
+            side = 1 if al0 > 0 else -1
+            _docklog_event("crab", "side from the two tags: mat tag %+.3f off the stand tag → %+d" % (al0, side))
+        elif rw0 and rw0.get("near_x") is not None and rw0.get("vps", 0) >= 3 and abs(rw0["near_x"] - x0) > 0.04:
             side = 1 if rw0["near_x"] > x0 else -1
             _docklog_event("crab", "side from the runway: centerline near end %+.2f vs tag %+.2f → %+d" % (rw0["near_x"], x0, side))
         elif abs(x0) > 0.06:
@@ -2054,7 +2098,16 @@ async def _dock_stage_approach():
                     await _dock_axis_crab(learner, yaw_med, z0=DOCK["axis_work_m"], lat_hint=(rw.get("lat") if rw else None))
                     _dock["_yaw_hist"] = []
                     continue
-                if abs(yaw_med) > DOCK["yaw_ok_deg"]:
+                al = see.get("align") if see else None
+                if al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    # the picture says NOT straight on (mat tag off to one side of the stand tag): fix it out at working distance
+                    _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
+                    _dock_set("axis", "not straight on - mat tag %+.0f%% off the stand tag - backing out to square up" % (al * 100))
+                    await _dock_retreat(learner, DOCK["axis_work_m"])
+                    await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=DOCK["axis_work_m"], lat_hint=al)
+                    _dock["_yaw_hist"] = []
+                    continue
+                if abs(yaw_med) > DOCK["yaw_ok_deg"] and al is None:
                     await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
                 await _dock_send(0, 0)
                 _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
