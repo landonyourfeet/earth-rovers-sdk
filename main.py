@@ -1174,6 +1174,10 @@ DOCK = {
     #   the docker reported all day was 1.44× too far ("1.0 m" turn = 0.69 m real, which is why the tail hit the plate).
     #   Flyer v3 prints the tag at 4.0 in. If a v2 sheet is still up, set DOCK_TAG_M=0.1057.
     "tag_m": float(os.getenv("DOCK_TAG_M", "0.1016")),              # printed tag side: 4.0 in (flyer v3)
+    # ★ Sep 6 evening (tape measure at the camera: 6 ft 5 in = 1.956 m; badge said 2.86 m): the lens is wider than the
+    #   76° we assumed, so ranges from the tag size were 1.46× too far. Rather than guess a focal length, SET FIX with
+    #   the true distance stores this scale and every tag range (front and rear) is multiplied by it.
+    "range_k": float(os.getenv("DOCK_RANGE_K", "1.0")),
     # ★ run 13 (Cap: "stops way too far away, like 5 feet"): the log said 0.70 m while the rover was ~1.5 m
     #   out. Back-solving from the tag's pixel size (41 px @640 at 1.5 m) the FRONT lens is ~76° wide, not the
     #   110° I assumed - every front-camera distance was ~1.8× short. Front and rear now have their own FOV.
@@ -1363,6 +1367,7 @@ def _dock_find_tag(gray, w, cam="front"):
         q = c[0]
         side = float(max(np.linalg.norm(q[0] - q[1]), np.linalg.norm(q[1] - q[2])))
         out = {"cx": float(q[:, 0].mean()) / w, "cy": float(q[:, 1].mean()) / h, "side_px": round(side * (640.0 / w), 1)}
+        _rk = _dock.get("range_k", DOCK["range_k"])
         try:
             fx = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
             K = np.array([[fx, 0, w / 2.0], [0, fx, h / 2.0], [0, 0, 1]], dtype=np.float64)
@@ -1376,15 +1381,15 @@ def _dock_find_tag(gray, w, cam="front"):
                 if float(np.dot(n, t)) > 0:        # make it point back toward the camera
                     n = -n
                 n = n.copy(); n[0] *= _dock.get("_normal_sign", 1.0)   # lateral sign learned on the way (see _dock_goto_axis)
-                out["x_m"] = round(float(t[0]), 3); out["z_m"] = round(float(t[2]), 3)
-                out["dist_m"] = round(float(np.linalg.norm(t)), 3)
+                out["x_m"] = round(float(t[0]) * _rk, 3); out["z_m"] = round(float(t[2]) * _rk, 3)
+                out["dist_m"] = round(float(np.linalg.norm(t)) * _rk, 3)
                 # yaw of the dock relative to our line of sight: 0 = we are on its axis
                 out["yaw_deg"] = round(math.degrees(math.atan2(float(n[0]), float(-n[2]))), 1)
                 # staging point: DOCK_STAGE_M out along the dock's axis, in camera coords
                 P = t + n * DOCK["stage_m"]
-                out["stage_x_m"] = round(float(P[0]), 3); out["stage_z_m"] = round(float(P[2]), 3)
+                out["stage_x_m"] = round(float(P[0]) * _rk, 3); out["stage_z_m"] = round(float(P[2]) * _rk, 3)
                 out["stage_bearing_deg"] = round(math.degrees(math.atan2(float(P[0]), float(P[2]))), 1)
-                out["stage_dist_m"] = round(float(math.hypot(P[0], P[2])), 3)
+                out["stage_dist_m"] = round(float(math.hypot(P[0], P[2])) * _rk, 3)
         except Exception as e:
             out["pose_error"] = str(e)[:60]
         return out
@@ -3661,15 +3666,28 @@ async def dock_post(request: Request):
         _docklog_event("zero", "zeroed: %s" % outz)
         return outz
     if action == "set_fix":
-        # parked at the fix (2-3 m out, on the axis, square): remember what the tag looks like from here
+        # parked at the fix (2-3 m out, on the axis, square): remember what the tag looks like from here.
+        # With `true_m` (a tape measure, camera to the tag's wall) the range scale is calibrated too.
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None; t = see and see.get("tag")
         if not t or not t.get("z_m"):
             return {"ok": False, "error": "tag not readable from here"}
+        true_m = body.get("true_m")
+        if true_m:
+            try:
+                true_m = float(true_m); old_k = _dock.get("range_k", DOCK["range_k"])
+                k = old_k * (true_m / float(t["z_m"]))
+                if 0.4 <= k <= 2.5:
+                    _dock["range_k"] = k
+                    logger.info("dock: RANGE CALIBRATED: tape %.3f m, tag said %.3f m → DOCK_RANGE_K=%.4f", true_m, t["z_m"], k)
+                    _docklog_event("range_cal", "range scale %.4f from a %.2f m tape measure" % (k, true_m))
+                    fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None; t = see and see.get("tag") or t
+            except Exception:
+                pass
         _dock["fix"] = {"side_px": t["side_px"], "z_m": t["z_m"], "at": time.time()}
         DOCK["fix_m"] = float(t["z_m"]); DOCK["fix_side_px"] = float(t["side_px"])
         logger.info("dock: FIX SET at %.2f m (tag %.0f px) → set DOCK_FIX_M=%.2f DOCK_FIX_SIDE_PX=%.0f", t["z_m"], t["side_px"], t["z_m"], t["side_px"])
         _docklog_event("fix", "fix set: %.2f m, tag %.0f px" % (t["z_m"], t["side_px"]))
-        return {"ok": True, "fix": _dock["fix"]}
+        return {"ok": True, "fix": _dock["fix"], "range_k": _dock.get("range_k", DOCK["range_k"])}
     if action == "zero_xmark":
         # the rover is parked dead on the dock axis, looking at the dock: whatever the sight reads now is build bias
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None
