@@ -1602,35 +1602,47 @@ def dock_xmark(img, tag, w, h):
     """★ Sep 6 (Cap taped a magenta sheet with a big black X on the wall above the backboard): a second
     marker on the dock's centerline at a different DEPTH. On the axis the X sits directly above the tag;
     off-axis it slides sideways - like a rifle's rear sight over the front sight. The X is behind the tag,
-    so: X right of the tag → rover is RIGHT of the axis → move LEFT. Returns the X's horizontal offset in
-    tag widths (+ = right of the tag), or None. Reads from 3 m, needs no decoding, no colour, no pose."""
+    so: X right of the tag → rover is RIGHT of the axis → move LEFT.
+    Returns {"off": <tag-widths, + = right of the tag>, ...debug} or {"off": None, "why": <reason>, ...}.
+    The debug fields exist because the first live run returned null everywhere and a null explains nothing."""
     try:
         cx = (tag["x_err"] + 0.5) * w; side = float(tag.get("side_px") or 0) * (w / 640.0)
         if side < 8:
-            return None
+            return {"off": None, "why": "tag too small"}
         cy = tag.get("cy")
         if cy is None:
-            return None
+            return {"off": None, "why": "tag has no cy"}
         cy = cy * h
-        y0 = int(max(0, cy - side * 4.2)); y1 = int(max(0, cy - side * 0.9))
-        x0 = int(max(0, cx - side * 2.2)); x1 = int(min(w, cx + side * 2.2))
+        # search band: from just above the tag to the top of the frame, 2.6 tag widths either side
+        y0 = 0; y1 = int(max(0, cy - side * 0.8))
+        x0 = int(max(0, cx - side * 2.6)); x1 = int(min(w, cx + side * 2.6))
         if y1 - y0 < 8 or x1 - x0 < 8:
-            return None
+            return {"off": None, "why": "no room above the tag", "band": [x0, y0, x1, y1]}
         roi = img[y0:y1, x0:x1]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 90))
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # the X is the darkest big thing on a light sheet: threshold relative to the band, not a fixed number
+        thr = int(min(110, max(60, np.percentile(gray, 12))))
+        dark = (gray <= thr).astype(np.uint8) * 255
         dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         cs, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cs = [c for c in cs if cv2.contourArea(c) >= (side * 0.35) ** 2]
-        if not cs:
-            return None
-        c = max(cs, key=cv2.contourArea); m = cv2.moments(c)
-        if not m["m00"]:
-            return None
-        xc = x0 + m["m10"] / m["m00"]
-        return round(float((xc - cx) / side), 3)
-    except Exception:
-        return None
+        cands = []
+        for c in cs:
+            x, y, bw, bh = cv2.boundingRect(c); a = cv2.contourArea(c)
+            if bw < side * 0.6 or bh < side * 0.6 or a < (side * 0.35) ** 2:
+                continue
+            fill = a / float(bw * bh)
+            if fill > 0.75:                         # a solid block is not an X (the X fills ~35-55% of its box)
+                continue
+            m = cv2.moments(c)
+            if not m["m00"]:
+                continue
+            cands.append({"cx": x0 + m["m10"] / m["m00"], "w": bw, "h": bh, "area": a, "fill": round(fill, 2)})
+        if not cands:
+            return {"off": None, "why": "no X-like dark shape above the tag", "thr": thr, "band": [x0, y0, x1, y1], "n_dark": len(cs)}
+        best = max(cands, key=lambda c: c["area"])
+        return {"off": round(float((best["cx"] - cx) / side), 3), "thr": thr, "cands": len(cands), "w": int(best["w"]), "fill": best["fill"]}
+    except Exception as e:
+        return {"off": None, "why": "error: " + str(e)[:80]}
 
 
 def dock_led_green(jpeg: bytes):
@@ -1952,7 +1964,8 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         #   (a) if the mat is readable, its centerline's near end lies on the side the dock axis runs toward -
         #   that is the side to move to; (b) otherwise the side the dock sits on in the frame. Never the yaw.
         al0 = see0.get("align") if see0 else None
-        xm0 = see0.get("xmark") if see0 else None
+        xm0d = see0.get("xmark") if see0 else None
+        xm0 = xm0d.get("off") if isinstance(xm0d, dict) else xm0d
         if xm0 is not None and abs(xm0) >= 0.15:
             side = -1 if xm0 > 0 else 1        # X right of the tag → we are right of the axis → move LEFT
             _docklog_event("crab", "side from the wall X: %+.2f tag-widths → move %s" % (xm0, "RIGHT" if side > 0 else "LEFT"))
@@ -2202,7 +2215,8 @@ async def _dock_stage_approach():
             awm = DOCK["axis_work_m"] if runway_ok else DOCK["axis_work_tag_m"]
             # ★ the wall X (rear sight over the front sight): a few consistent readings of the X sitting to one
             #   side of the tag is a side-of-axis measurement from any distance. It outranks the tag's yaw.
-            xm = see.get("xmark") if see else None
+            xmd = see.get("xmark") if see else None
+            xm = xmd.get("off") if isinstance(xmd, dict) else xmd
             xh = _dock.setdefault("_xmark_hist", [])
             if xm is not None:
                 xh.append(xm); del xh[:-5]
@@ -2284,7 +2298,8 @@ async def _dock_stage_approach():
                     await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=awm, lat_hint=al)
                     _dock["_yaw_hist"] = []
                     continue
-                xm_now = see.get("xmark") if see else None
+                xm_nowd = see.get("xmark") if see else None
+                xm_now = xm_nowd.get("off") if isinstance(xm_nowd, dict) else xm_nowd
                 if xm_now is not None and abs(xm_now) > DOCK["xmark_ok"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "not straight on - wall X %+.2f tag-widths off the tag - backing out to square up" % xm_now)
@@ -2628,9 +2643,22 @@ async def _dock_final(z_from: float):
     _docklog_event("raw_telemetry", "at contact", {"raw": telemetry_hub.latest})
     last_raw = time.time()
     rise_n = 0
+    # ★ Sep 6 (four runs in a row: on the pads, battery flat, Connect's tracker saying "drain stopped", and the
+    #   docker calling no-charge): the trickle signature IS the pass. Did the battery fall while we were
+    #   driving this run? Then a battery that holds for 2 minutes at rest on the stand is charging.
+    bats = [t.get("bat") for t in _docklog.get("ticks", []) if t.get("bat") is not None]
+    drained_on_the_way = bool(bats) and (max(bats) - min(bats)) >= 1
+    flat_since = None
     while True:
         await asyncio.sleep(3.0)
         b = _dock_battery()
+        if b is not None and b0 is not None:
+            if b >= b0:
+                flat_since = flat_since or time.time()
+            else:
+                flat_since = None; b0 = b
+        if flat_since and drained_on_the_way and time.time() - flat_since >= 120:
+            _dock["state"] = "docked"; _dock_set("docked", "charging - drain stopped, battery holding %s%% for 2 min on the stand" % b); _odo_set_home("self-dock charging"); await _dock_self_calibrate("drain stopped"); return True
         led = None
         try:
             fr = await _dock_frame("rear"); led = dock_led_green(fr.jpeg) if fr else None
@@ -2654,6 +2682,9 @@ async def _dock_final(z_from: float):
         if b0 is not None and b is not None and b0 >= 99:
             _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
         if time.time() - tw > DOCK["charge_wait_s"]:
+            if not nudged and flat_since:
+                # holding but not proven yet (no drain earlier in the run to compare against): give it the 2 min, no push
+                nudged = True; tw = time.time() - (DOCK["charge_wait_s"] - 130.0); continue
             if not nudged:
                 nudged = True
                 _dock_set("nudge", "no charge after %ds - one more push, then 20 s to show a rise" % DOCK["charge_wait_s"])
