@@ -3311,9 +3311,41 @@ def _dock_status():
             "phase_s": (round(time.time() - _dock["since"], 1) if _dock["since"] else None), "cmds": _dock["cmds"]}
 
 
+_lock_cache = {"t": 0.0, "v": None}
+
+
+async def _dock_target_lock():
+    """★ Cap (Sep 6): "an icon on the screen when it detects the tag so I know when to set the zero." One
+    front-camera read per request (Connect polls every few seconds), only while the browser is joined,
+    never launching it. Cached for a second so a burst of polls costs one decode."""
+    now = time.time()
+    if now - _lock_cache["t"] < 1.0:
+        return _lock_cache["v"]
+    out = {"tag": False}
+    try:
+        if browser_service.is_ready() if hasattr(browser_service, "is_ready") else True:
+            fr = await feed_broadcasters["front"].get_frame(max_age=1.5, timeout=1.5, fps=2)
+            if fr:
+                see = dock_see(fr.jpeg, "front")
+                t = see and see.get("tag"); wl = see and see.get("wall"); xm = see and see.get("xmark")
+                out = {"tag": bool(t), "side_px": (t or {}).get("side_px"), "x_err": (t or {}).get("x_err"), "z_m": (t or {}).get("z_m"),
+                       "wall_phi": (wl or {}).get("phi") if isinstance(wl, dict) else None, "wall_q": (wl or {}).get("q") if isinstance(wl, dict) else None,
+                       "xmark": (xm or {}).get("off") if isinstance(xm, dict) else None}
+    except Exception as e:
+        out = {"tag": False, "error": str(e)[:60]}
+    _lock_cache["t"] = now; _lock_cache["v"] = out
+    return out
+
+
 @app.get("/dock")
 async def dock_get():
-    return _dock_status()
+    st = _dock_status()
+    if not st.get("active"):
+        try:
+            st["lock"] = await _dock_target_lock()
+        except Exception:
+            st["lock"] = None
+    return st
 
 
 @app.get("/dock/log")
