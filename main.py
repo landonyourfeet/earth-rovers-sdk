@@ -1126,14 +1126,15 @@ DOCK = {
     "xmark_ok": float(os.getenv("DOCK_XMARK_OK", "0.08")),            # X stacked within this = straight on
     "xmark_bias": float(os.getenv("DOCK_XMARK_BIAS", "0")),          # build bias: X not perfectly over the tag (zero it: /dock zero_xmark)
     "xmark_depth_m": float(os.getenv("DOCK_XMARK_DEPTH_M", "0.15")), # how far BEHIND the tag plane the X sits
-    "wall_bias": float(os.getenv("DOCK_WALL_BIAS", "0")),            # residual wall angle when parked square (zero it)
+    "wall_bias": float(os.getenv("DOCK_WALL_BIAS", "0")),            # (legacy) residual angle; superseded by wall_slope_bias
+    "wall_slope_bias": float(os.getenv("DOCK_WALL_SLOPE_BIAS", "0")),  # the junction's image slope when parked square (camera roll) - ZERO sets it
     # ★ the wall angle is atan(slope · f / dy) where dy is the junction's drop below the HORIZON. The lens does not
     #   look exactly level, so the horizon is not the image center: ZERO calibrates it from the fix distance and
     #   the camera height (dy_expected = f·h/D). With the image center used instead, dy read 9 px at 3.3 m and the
     #   angle blew up to -73°.
     "cam_height_m": float(os.getenv("DOCK_CAM_HEIGHT_M", "0.12")),   # camera lens above the wall-floor junction
     "horizon_y": float(os.getenv("DOCK_HORIZON_Y", "0.5")),          # horizon row as a fraction of frame height (ZERO sets it)
-    "wall_q_min": float(os.getenv("DOCK_WALL_Q_MIN", "0.5")),        # RANSAC inlier ratio needed to trust the wall
+    "wall_q_min": float(os.getenv("DOCK_WALL_Q_MIN", "0.35")),       # RANSAC inlier ratio needed to trust the wall (run 16:33 read a clean line at 0.46 and was thrown out at 0.5)
     "fix_m": float(os.getenv("DOCK_FIX_M", "2.0")),                  # ★ Cap (Sep 6): the fix is 2 m; nothing gets closer unless lined up there
     "fix_side_px": float(os.getenv("DOCK_FIX_SIDE_PX", "0")),        # captured tag size at the fix (0 = derive from fix_m)
     "fix_phi_deg": float(os.getenv("DOCK_FIX_PHI_DEG", "3")),        # square to the wall within this at the fix
@@ -1702,8 +1703,9 @@ def dock_wall(img, cam="front"):
         dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
         if dy < 6:
             return {"phi": None, "why": "junction too near the horizon", "dy": round(float(dy)), "y_line": round(float(y_line)), "slope": round(float(sl), 4)}
-        phi = -math.degrees(math.atan(sl * fx / dy))
-        return {"phi": round(float(phi - _dock.get("wall_bias", DOCK["wall_bias"])), 1), "raw": round(float(phi), 1), "slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
+        sl_c = sl - _dock.get("wall_slope_bias", DOCK["wall_slope_bias"])
+        phi = -math.degrees(math.atan(sl_c * fx / dy))
+        return {"phi": round(float(phi), 1), "raw": round(float(-math.degrees(math.atan(sl * fx / dy))), 1), "slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
     except Exception as e:
         return {"phi": None, "why": "error: " + str(e)[:80]}
 
@@ -3325,16 +3327,18 @@ async def dock_post(request: Request):
             dy_expected = fx * DOCK["cam_height_m"] / float(t["z_m"])
             _dock["horizon_y"] = float((wl["y_line"] - dy_expected) / hh)
             outz["horizon_y"] = round(_dock["horizon_y"], 4); outz["dy_expected"] = round(dy_expected, 1); outz["y_line"] = wl["y_line"]
+            _dock["wall_slope_bias"] = float(wl["slope"]); outz["wall_slope_bias"] = round(float(wl["slope"]), 4)
+            _dock["wall_bias"] = 0.0
             phi0 = -math.degrees(math.atan(wl["slope"] * fx / max(6.0, dy_expected)))
-            _dock["wall_bias"] = float(phi0); outz["wall_bias"] = round(phi0, 1)
-            if abs(phi0) > 12:
-                outz["warning"] = "residual %+.0f° is large - was the rover square to the wall? (or DOCK_CAM_HEIGHT_M is off)" % phi0
+            outz["angle_zeroed_out"] = round(phi0, 1)
+            if abs(phi0) > 25:
+                outz["warning"] = "that slope would be %+.0f° - either the rover was not square to the wall, or the camera is rolled; if it was square this is fine" % phi0
         elif wl and wl.get("raw") is not None:
             _dock["wall_bias"] = float(wl["raw"]); outz["wall_bias"] = wl["raw"]
         xmd = see.get("xmark") if see else None
         if isinstance(xmd, dict) and xmd.get("off") is not None:
             _dock["xmark_bias"] = float(xmd["off"]); outz["xmark_bias"] = xmd["off"]
-        logger.info("dock: ZEROED %s → set DOCK_WALL_BIAS=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_bias"), outz.get("horizon_y"), outz.get("xmark_bias"))
+        logger.info("dock: ZEROED %s → set DOCK_WALL_SLOPE_BIAS=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_slope_bias"), outz.get("horizon_y"), outz.get("xmark_bias"))
         _docklog_event("zero", "zeroed: %s" % outz)
         return outz
     if action == "set_fix":
