@@ -1701,6 +1701,58 @@ def _dock_wall_high_line(g, w, h, fx):
         return None
 
 
+def _dock_wall_bar(g, w, h, fx, tag):
+    """★ Sep 6 evening: the MOVING YOU UP bar. The generic high-line reader sampled every column of the
+    frame and found the bar in 14 of 44 - the bar is only ~130 px wide at 2.4 m, so it can never win a
+    frame-wide vote. This reader knows where the bar is (above the tag, on the flyer's columns) and fits
+    its top and bottom edges there. Returns slope/dy/q or None."""
+    try:
+        if not tag or not tag.get("side_px") or tag.get("cy") is None:
+            return None
+        side = float(tag["side_px"]) * (w / 640.0); cx = (tag["x_err"] + 0.5) * w; cy = tag["cy"] * h
+        # the bar is ~1.7 tag-widths above the tag center (flyer layout), 1.6 in thick ≈ 0.27 tag widths
+        y_c = cy - side * 1.85
+        y0 = int(max(0, y_c - side * 1.4)); y1 = int(min(h - 1, y_c + side * 0.9))
+        x0 = int(max(4, cx - side * 1.7)); x1 = int(min(w - 4, cx + side * 1.7))
+        if y1 - y0 < 12 or x1 - x0 < 24:
+            return None
+        tops = []; bots = []
+        step = max(3, int((x1 - x0) / 24))
+        for x in range(x0, x1, step):
+            prof = g[y0:y1, x - 2:x + 3].mean(axis=1); grad = np.diff(prof)
+            if len(grad) < 6:
+                continue
+            i_top = int(np.argmin(grad))     # light → dark (top edge of the bar)
+            i_bot = int(np.argmax(grad))     # dark → light (bottom edge)
+            if i_bot > i_top + 3 and -grad[i_top] > 25 and grad[i_bot] > 25 and (i_bot - i_top) < side * 0.6:
+                tops.append((x, y0 + i_top)); bots.append((x, y0 + i_bot))
+        if len(tops) < 6:
+            return None
+        def fit(pts):
+            P = np.array(pts, dtype=np.float64); A = np.vstack([P[:, 0], np.ones(len(P))]).T
+            sl, b = np.linalg.lstsq(A, P[:, 1], rcond=None)[0]
+            res = np.abs(P[:, 1] - (sl * P[:, 0] + b)); keep = res < 2.0
+            if keep.sum() >= 5:
+                Q = P[keep]; A = np.vstack([Q[:, 0], np.ones(len(Q))]).T; sl, b = np.linalg.lstsq(A, Q[:, 1], rcond=None)[0]
+            return float(sl), float(b), int(keep.sum())
+        st, bt, nt = fit(tops); sb, bb, nb = fit(bots)
+        sl = (st + sb) / 2.0; y_line = ((st * cx + bt) + (sb * cx + bb)) / 2.0
+        dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
+        q = min(1.0, (nt + nb) / float(2 * len(tops)))
+        return {"slope": round(sl, 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": nt + nb, "of": 2 * len(tops), "q": round(q, 2), "bar": True}
+    except Exception:
+        return None
+
+
+def _dock_wall_from_high_only(g, w, h, fx, why_floor, tag=None):
+    hi = _dock_wall_bar(g, w, h, fx, tag) or _dock_wall_high_line(g, w, h, fx)
+    if hi and abs(hi["dy"]) >= 40:
+        sl_c = hi["slope"] - _dock.get("wall_slope_bias_high", DOCK["wall_slope_bias"])
+        phi = -math.degrees(math.atan(sl_c * fx / hi["dy"]))
+        return {"phi": round(float(phi), 1), "src": "bar" if hi.get("bar") else "high", "raw": round(float(-math.degrees(math.atan(hi["slope"] * fx / hi["dy"]))), 1), "slope": hi["slope"], "dy": hi["dy"], "q": hi["q"], "floor": None, "high": hi, "note": why_floor}
+    return {"phi": None, "why": why_floor + ("; high line " + ("too near the horizon" if hi else "not found")), "high": hi}
+
+
 def dock_wall(img, cam="front", tag=None):
     """★ Sep 6 (Cap taped the tag flat on the wall, so the dock axis IS the wall normal; the browser
     session's plan: measure the WALL, not the tag). The wall-floor junction runs the full width of the
@@ -1725,7 +1777,7 @@ def dock_wall(img, cam="front", tag=None):
             if -grad[yb] > 6 and prof[max(0, yb - 6):yb + 1].mean() > 110:
                 pts.append((x, y_lo + yb))
         if len(pts) < 20:
-            return {"phi": None, "why": "junction not found", "n": len(pts)}
+            return _dock_wall_from_high_only(g, w, h, fx0, "floor junction not found (%d pts)" % len(pts), tag)
         P = np.array(pts, dtype=np.float64); best = None; rng = np.random.default_rng(7)
         for _ in range(300):
             i, j = rng.choice(len(P), 2, replace=False)
@@ -1737,7 +1789,7 @@ def dock_wall(img, cam="front", tag=None):
                 best = (int(inl.sum()), inl)
         n, inl = best
         if n < max(12, int(0.35 * len(P))):
-            return {"phi": None, "why": "no consistent junction line", "n": len(P), "inliers": n}
+            return _dock_wall_from_high_only(g, w, h, fx0, "no consistent floor line (%d/%d)" % (n, len(P)), tag)
         Q = P[inl]; A = np.vstack([Q[:, 0], np.ones(len(Q))]).T; sl, b = np.linalg.lstsq(A, Q[:, 1], rcond=None)[0]
         fx = fx0
         y_line = sl * (w / 2.0) + b
@@ -1750,9 +1802,9 @@ def dock_wall(img, cam="front", tag=None):
         cands = []
         if abs(dy) >= 40:
             cands.append(("floor", sl, dy, low["q"]))
-        hi = _dock_wall_high_line(g, w, h, fx0)
+        hi = _dock_wall_bar(g, w, h, fx0, tag) or _dock_wall_high_line(g, w, h, fx0)
         if hi and abs(hi["dy"]) >= 40:
-            cands.append(("high", hi["slope"], hi["dy"], hi["q"]))
+            cands.append(("bar" if hi.get("bar") else "high", hi["slope"], hi["dy"], hi["q"]))
         if not cands:
             return {"phi": None, "why": "no wall line far enough from the horizon (floor dy %d%s)" % (round(float(dy)), (", high dy %d" % hi["dy"]) if hi else ""), "floor": low, "high": hi}
         src, sl_u, dy_u, q_u = max(cands, key=lambda c: abs(c[2]) * c[3])
@@ -2033,9 +2085,38 @@ async def _dock_stage_one(learner):
             if t and t.get("z_m") and wl and wl.get("phi") is not None and (wl.get("q") or 0) >= DOCK["wall_q_min"]:
                 reads.append((wl["phi"], bearing(t["x_err"]), t["z_m"], (see.get("xmark") or {}).get("off") if isinstance(see.get("xmark"), dict) else None))
         if len(reads) < 3:
-            # Cap: "at no point should it get closer than 2 m unless perfectly lined up." No measurement = no
-            #   permission. Back to the fix distance and try to read again; three misses is an honest failure.
-            _docklog_event("stage1", "wall not measurable here (%d good reads) - backing to the fix and re-acquiring (%d/3)" % (len(reads), attempt + 1))
+            # ★ Sep 6 evening (run 23:10, the doorway room): the rover sat ON the fix - tag 26 px, bearing 0.02,
+            #   X sight 0.038 on a 128-px detection - and was refused because the WALL reader specifically could
+            #   not find a line on a white baseboard against a white wall. The wall is opportunistic; the X sight
+            #   (position on the axis) plus the tag bearing (aim) is the whole condition for the fix. Any two of
+            #   three agree → lined up. With no wall, the X says which side and the tag says where to point.
+            xr = []
+            for _ in range(5):
+                sv = await _dock_settled_look("front"); tv = sv and sv.get("tag"); xd = sv and sv.get("xmark")
+                xo = xd.get("off") if isinstance(xd, dict) else None
+                if tv and tv.get("z_m") and xo is not None:
+                    xr.append((xo - _dock.get("xmark_bias", DOCK["xmark_bias"]), tv["x_err"], tv["z_m"], tv["side_px"]))
+            if len(xr) >= 3:
+                xo = sorted(r[0] for r in xr)[len(xr) // 2]; xe = sorted(r[1] for r in xr)[len(xr) // 2]
+                zz = sorted(r[2] for r in xr)[len(xr) // 2]
+                if abs(xo) <= DOCK["xmark_ok"] and abs(xe) <= 0.03 and abs(zz - F) <= 0.6:
+                    _docklog_event("stage1", "no wall line in this room; X sight %+.3f and tag bearing %+.2f agree - lined up at the fix (%.2f m)" % (xo, xe, zz))
+                    _dock_set("stage1", "at the fix by X sight + tag bearing (no wall line here) - lined up"); return True
+                if abs(xo) > DOCK["xmark_ok"]:
+                    # off the axis: plan from the sight alone (side + size from the X geometry), then re-verify
+                    d_est = abs(xo) * DOCK["tag_m"] * (max(zz, 0.5) + DOCK["xmark_depth_m"]) / DOCK["xmark_depth_m"]
+                    d_est = max(0.15, min(1.5, d_est))
+                    if d_est < DOCK["min_leg_m"] * 0.6:
+                        _docklog_event("stage1", "X sight %+.3f is inside trim range - lined up enough; final holds the line" % xo)
+                        _dock_set("stage1", "at the fix by X sight (%.0f cm off) - flying straight" % (d_est * 100)); return True
+                    side = -1 if xo > 0 else 1
+                    _docklog_event("stage1", "no wall line; X sight %+.3f → %.2f m %s of the axis - dogleg from the sight (%d/3)" % (xo, d_est, "right" if side < 0 else "left", attempt + 1))
+                    _dock["_crab_side_hint"] = side
+                    await _dock_axis_crab(learner, side * -1 * math.degrees(math.asin(min(0.95, d_est / max(zz, 0.6)))), z0=max(zz, F), lat_hint=None)
+                    if attempt >= 2:
+                        await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "three passes on the X sight and still off the axis - not going in"); return None
+                    continue
+            _docklog_event("stage1", "wall not measurable here (%d good reads) and no usable X sight - backing to the fix and re-acquiring (%d/3)" % (len(reads), attempt + 1))
             await _dock_retreat(learner, F + 0.3)
             if attempt >= 2:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "could not measure the wall at the fix - not going in"); return None
@@ -2052,17 +2133,34 @@ async def _dock_stage_one(learner):
         # rover position: tag direction in world frame is heading + bearing
         a = math.radians(phi + beta)                 # world angle of the tag direction, from "toward the wall", right-positive
         xr = -D * math.sin(a); yr = D * math.cos(a)   # rover position (tag at origin, +y into the room)
-        lat = xr                                       # lateral offset from the axis (+ = right of axis)
+        lat = xr                                       # lateral offset from the axis (+ = right of axis), from the WALL
         cross = (xm is not None) and ((xm > 0) == (lat > 0))   # X right of the tag ⇔ rover right of the axis
         _docklog_event("stage1", "measured: wall φ %+.1f°, tag bearing %+.1f°, range %.2f m → rover %.2f m beside the axis, %.2f m out%s" % (phi, beta, D, lat, yr, ("; X sight agrees" if xm is not None and cross else ("; X sight DISAGREES (%+.2f)" % xm) if xm is not None else "")))
-        if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15:
+        # ★ run 23:15 (straight start, X -0.01, bearing -2.8°): the WALL read -11.6° on an uncalibrated build,
+        #   planned "turn -86°, drive 0.65 m", and knocked a lined-up rover 53° crooked. The X sight is the
+        #   POSITION sensor whenever it reads; the wall only ever contributes heading. If the X says on-axis,
+        #   the rover is on-axis. If the X says off, the offset is sized from the X, not from a wall angle.
+        if xm is not None:
+            if abs(xm) <= DOCK["xmark_ok"]:
+                if abs(lat) > DOCK["fix_lat_m"]:
+                    _docklog_event("stage1", "X sight says ON the axis (%+.3f); the wall's %.2f m offset is overruled" % (xm, lat))
+                lat = 0.0
+            else:
+                d_x = abs(xm) * DOCK["tag_m"] * (max(D, 0.5) + DOCK["xmark_depth_m"]) / DOCK["xmark_depth_m"]
+                lat = (1 if xm > 0 else -1) * max(0.15, min(1.5, d_x))
+                xr = lat
+        if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15 and False:
             _docklog_event("stage1", "two sensors disagree on the side - not planning on either (%d/3)" % (attempt + 1))
             await _dock_retreat(learner, F + 0.3)
             if attempt >= 2:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "sensors disagree at the fix - not going in"); return None
             continue
         # already at the fix?
-        if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.6:
+        wall_calibrated = (_dock.get("wall_slope_bias") is not None) or DOCK["wall_slope_bias"] != 0 or DOCK["horizon_y"] != 0.5 or _dock.get("horizon_y") is not None
+        phi_gate = phi if wall_calibrated else 0.0
+        if not wall_calibrated:
+            _docklog_event("stage1", "wall not zeroed on this build (bias 0 / horizon 0.5) - its angle informs, it does not gate; press ZERO at the fix")
+        if abs(lat) <= DOCK["fix_lat_m"] and abs(phi_gate) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.6:
             _dock_set("stage1", "at the fix: %.0f cm beside the axis, φ %+.0f° - lined up" % (lat * 100, phi)); return True
         # 3. plan once: turn to face the fix point, drive there, turn to face the wall
         vx, vy = 0.0 - xr, F - yr
@@ -2128,7 +2226,15 @@ async def _dock_stage_one(learner):
             continue
         phi2 = sorted(r[0] for r in ok_reads)[len(ok_reads) // 2]; lat2 = sorted(r[1] for r in ok_reads)[len(ok_reads) // 2]
         z2 = sorted(r[2] for r in ok_reads)[len(ok_reads) // 2]; xe2 = sorted(r[4] for r in ok_reads)[len(ok_reads) // 2]
-        passed = abs(lat2) <= DOCK["fix_lat_m"] and abs(phi2) <= DOCK["fix_phi_deg"] and abs(xe2) <= 0.03
+        xm2s = []
+        for _ in range(3):
+            sv = await _dock_settled_look("front"); xd = sv and sv.get("xmark"); xo = xd.get("off") if isinstance(xd, dict) else None
+            if xo is not None:
+                xm2s.append(xo - _dock.get("xmark_bias", DOCK["xmark_bias"]))
+        if xm2s:
+            xm2 = sorted(xm2s)[len(xm2s) // 2]
+            lat2 = 0.0 if abs(xm2) <= DOCK["xmark_ok"] else (1 if xm2 > 0 else -1) * max(0.15, abs(xm2) * DOCK["tag_m"] * (z2 + DOCK["xmark_depth_m"]) / DOCK["xmark_depth_m"])
+        passed = abs(lat2) <= DOCK["fix_lat_m"] and abs(phi2 if wall_calibrated else 0.0) <= DOCK["fix_phi_deg"] and abs(xe2) <= 0.03
         _docklog_event("stage1", "verify at the fix: %.0f cm beside the axis, φ %+.1f°, range %.2f m, tag %+.0f%% → %s" % (lat2 * 100, phi2, z2, xe2 * 100, "PASS" if passed else "fail"))
         if passed:
             _dock_set("stage1", "lined up at the fix - handing off to final"); return True
