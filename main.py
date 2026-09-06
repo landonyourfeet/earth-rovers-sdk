@@ -1847,13 +1847,19 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         else:
             side = 1 if y0 > 0 else -1   # last resort; the probe leg will correct it
     hfov = math.radians(DOCK["hfov_deg"])
+    # ★ 9:45 PM - Cap: "it literally turns AWAY from the goal every time, then corrects back." He was right
+    #   and I was wrong all evening: `side` means "move toward the +x side of the picture", but the pulse
+    #   takes an ANGULAR sign, and on this rover a positive angular is a LEFT turn. The centering code
+    #   already knows the mapping (learner.sign() turns the rover toward a tag on the + side); the dogleg
+    #   was ignoring it. Every first turn went the wrong way by exactly one sign. Fixed here, once.
+    turn = learner.sign() * side          # angular sign that rotates the rover TOWARD side
     # (1) turn out: measure the ROTATION by how far the tag moved in the frame, not where it ended up
     x_out = x0; turned = 0.0
     for _ in range(9):
-        see = await _dock_pulse_turn(side, "front"); tag = see and see.get("tag")
+        see = await _dock_pulse_turn(turn, "front"); tag = see and see.get("tag")
         _dock_log_tick("crab", "turn-out x_err=%s" % (tag and tag["x_err"]))
         if not tag:
-            await _dock_pulse_turn(-side, "front"); break
+            await _dock_pulse_turn(-turn, "front"); break
         x_out = tag["x_err"]
         if abs(x_out - x0) >= 0.40 or abs(x_out) >= 0.42:
             break
@@ -1865,7 +1871,7 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         _dock["_crab_probed"] = True
         leg = min(leg, 0.4)
     _dock_set("axis", "dogleg: %.0f cm beside the axis · turned %d° · leg %.2f m" % (d * 100, math.degrees(phi), leg))
-    _docklog_event("crab", "dogleg side %+d: d=%.2f phi=%d° leg=%.2f" % (side, d, math.degrees(phi), leg))
+    _docklog_event("crab", "dogleg toward the %s of the picture (angular %+d): d=%.2f phi=%d° leg=%.2f" % ("RIGHT" if side > 0 else "LEFT", int(turn), d, math.degrees(phi), leg))
     # (2) the leg, straight
     await _dock_send(DOCK["fwd"], 0.0); await asyncio.sleep(leg / (DOCK["fwd"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
     _dock_log_tick("crab", "leg %.2f" % leg)
@@ -1875,7 +1881,7 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         see = await _dock_settled_look("front"); tag = see and see.get("tag")
         _dock_log_tick("crab", "turn-back x_err=%s" % (tag and tag["x_err"]))
         if not tag:
-            await _dock_pulse_turn(-side, "front"); continue
+            await _dock_pulse_turn(-turn, "front"); continue
         if abs(tag["x_err"]) < 0.08:
             break
         await _dock_pulse_turn(learner.sign() * tag["x_err"], "front")
