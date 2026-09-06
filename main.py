@@ -1819,6 +1819,19 @@ async def _dock_send(linear: float, angular: float):
     try:
         await _dispatch_browser_control(cmd)
     except Exception as e:
+        # ★ Sep 6 log: "Motion rejected because a safety stop took priority" - the docker's stop-and-look cadence
+        #   (pulse 0.3 s, settle 0.45 s, a 1024-px capture) outlasts the 1 s dead-man, the watchdog queues a stop,
+        #   and the NEXT pulse is refused. Every refused pulse was a lost step. Wait for the stop to clear, resend.
+        if "safety stop" in str(e):
+            for _ in range(15):
+                await asyncio.sleep(0.1)
+                if not _confirmed_stop_pending():
+                    break
+            try:
+                arm_control_watchdog(cmd)
+                await _dispatch_browser_control(cmd); return
+            except Exception as e2:
+                logger.warning("dock: control send failed after the safety stop cleared: %s", e2); return
         logger.warning("dock: control send failed: %s", e)
 
 
