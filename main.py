@@ -1662,18 +1662,27 @@ def _dock_yaw(see):
     if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3 and abs(rw["yaw_deg"]) < 60:
         return float(rw["yaw_deg"]), "runway", DOCK["yaw_runway_noise"]
     tag = (see or {}).get("tag")
-    if tag and tag.get("yaw_deg") is not None and (tag.get("side_px") or 0) >= DOCK["yaw_min_px"]:
+    if tag and tag.get("yaw_deg") is not None and (tag.get("side_px") or 0) >= 20:
+        # any decodable tag contributes a reading; _yaw_solid decides whether the SERIES is a measurement
         n = _yaw_noise_deg(tag["side_px"]); y = float(tag["yaw_deg"])
-        return (0.0 if abs(y) < n else y), "tag", n
+        return y, "tag", n
     return None, "unknown", 90.0
 
 
 def _yaw_solid(hist, yaw_med, noise):
-    """A yaw worth manoeuvring on: several trusted readings, agreeing in sign, outside the noise band."""
-    if len(hist) < 3 or abs(yaw_med) <= noise:
+    """A yaw worth manoeuvring on. Two ways to earn it:
+      - a few readings outside the size-scaled noise band, agreeing in sign (the original rule), or
+      - ★ run 20260906-141437 (45° start): fifteen consecutive readings of -26…-33° on a 23-40 px tag were
+        thrown away as "unmeasurable" and the rover drove straight at the dock from 45° off. Noise does not
+        produce eight same-sign readings above 18° in a row; consistency is a measurement in its own right."""
+    if len(hist) < 3:
         return False
     same = sum(1 for v in hist if (v > 0) == (yaw_med > 0))
-    return same >= max(3, len(hist) - 1)
+    if abs(yaw_med) > noise and same >= max(3, len(hist) - 1):
+        return True
+    if len(hist) >= 8 and abs(yaw_med) >= 18 and same >= len(hist) - 1 and abs(yaw_med) >= noise * 0.45:
+        return True
+    return False
 
 
 async def _dock_send(linear: float, angular: float):
@@ -2136,7 +2145,7 @@ async def _dock_stage_approach():
             runway_ok = (yaw_src == "runway")
             yaw_hist = _dock.setdefault("_yaw_hist", [])
             if yaw_known:
-                yaw_hist.append(yaw); del yaw_hist[:-5]
+                yaw_hist.append(yaw); del yaw_hist[:-10]
             yaw_med = (sorted(yaw_hist)[len(yaw_hist) // 2] if yaw_hist else 0.0) if yaw_known else 0.0
             yaw_ok = yaw_known and _yaw_solid(yaw_hist, yaw_med, yaw_noise)
             if not yaw_ok:
@@ -2144,13 +2153,34 @@ async def _dock_stage_approach():
             # where axis work happens: Cap's 1.5 m fix when the mat lines carry the yaw, otherwise only as
             # far out as the tag can still be measured
             awm = DOCK["axis_work_m"] if runway_ok else DOCK["axis_work_tag_m"]
+            # ★ "close to measure": with no solid yaw beyond ~1.3 m, drive straight until the tag is big enough,
+            #   then STOP and take a proper reading (several settled looks) before deciding anything. "Get
+            #   closer" and "may manoeuvre" used to be the same threshold, so the decision always came too late.
+            if not yaw_ok and z > 1.3 and not _dock.get("_measured_once"):
+                if z > 1.35:
+                    ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
+                    await _dock_send(DOCK["fwd"], ang); _dock_set("closing", "closing to measure the angle · %.2f m" % z)
+                    _dock_log_tick("approach", "closing"); await asyncio.sleep(1.0 / DOCK["hz"]); continue
+            if not yaw_ok and 0.9 <= z <= 1.35 and not _dock.get("_measured_once"):
+                await _dock_send(0, 0); _dock["_measured_once"] = True
+                ys = []
+                for _ in range(6):
+                    sv = await _dock_settled_look("front"); yv, _src, _n = _dock_yaw(sv)
+                    if yv is not None:
+                        ys.append(yv)
+                if ys:
+                    _dock["_yaw_hist"] = ys[-10:]; yaw_hist = _dock["_yaw_hist"]
+                    yaw_med = sorted(ys)[len(ys) // 2]; yaw_ok = _yaw_solid(yaw_hist, yaw_med, _n if ys else 90.0)
+                    _docklog_event("measure", "stopped at %.2f m to measure: yaw readings %s → %s" % (z, [int(v) for v in ys], ("%+d° solid" % yaw_med) if yaw_ok else "not solid → straight in"))
+                    if not yaw_ok:
+                        yaw_med = 0.0
             if yaw_ok and abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                 await _dock_send(0, 0)
                 if z < awm:
                     await _dock_retreat(learner, awm)
                 _dock_set("axis", "getting onto the dock axis · yaw %+d° · dogleg %d/%d" % (yaw_med, _dock["_crab_n"], DOCK["axis_align_max"]))
-                await _dock_axis_crab(learner, yaw_med, z0=z, lat_hint=(rw.get("lat") if rw else None))
+                await _dock_axis_crab(learner, yaw_med, z0=max(z, awm), lat_hint=None)   # size from the measured yaw, never the lat hint
                 _dock["_yaw_hist"] = []
                 continue
             if not far_offaxis:
@@ -2560,9 +2590,9 @@ async def _dock_final(z_from: float):
         if time.time() - tw > DOCK["charge_wait_s"]:
             if not nudged:
                 nudged = True
-                _dock_set("nudge", "no charge after %ds - one more push" % DOCK["charge_wait_s"])
+                _dock_set("nudge", "no charge after %ds - one more push, then 20 s to show a rise" % DOCK["charge_wait_s"])
                 await _dock_send(-DOCK["rev_final"], 0.0); await asyncio.sleep(DOCK["nudge_s"]); await _dock_send(0, 0)
-                tw = time.time(); b0 = _dock_battery(); continue
+                tw = time.time() - (DOCK["charge_wait_s"] - 20.0); b0 = _dock_battery(); continue   # ★ the nudge gets 20 s, not another full wait
             # still no charge: on the stand but the coils are not lined up - back off and dock again
             if _dock.get("_reseat_runs", 0) < DOCK["reseat_max"]:
                 _dock["_reseat_runs"] = _dock.get("_reseat_runs", 0) + 1
@@ -2809,7 +2839,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
