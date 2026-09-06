@@ -1422,7 +1422,7 @@ def dock_see(jpeg: bytes, cam: str):
             break
     if cam == "front":
         try:
-            out["wall"] = dock_wall(img, cam)
+            out["wall"] = dock_wall(img, cam, out.get("tag"))
         except Exception:
             out["wall"] = None
     # magenta sheet: purple-magenta blobs above the floor line
@@ -1668,7 +1668,7 @@ def dock_xmark(img, tag, w, h):
         return {"off": None, "why": "error: " + str(e)[:80]}
 
 
-def dock_wall(img, cam="front"):
+def dock_wall(img, cam="front", tag=None):
     """★ Sep 6 (Cap taped the tag flat on the wall, so the dock axis IS the wall normal; the browser
     session's plan: measure the WALL, not the tag). The wall-floor junction runs the full width of the
     frame - 1024 px of baseline instead of a 29 px tag. Square to the wall it images level; off-square it
@@ -1678,7 +1678,14 @@ def dock_wall(img, cam="front"):
     try:
         h, w = img.shape[:2]
         g = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32), (7, 7), 0)
-        y_lo, y_hi = int(h * 0.30), int(h * 0.95); pts = []
+        fx0 = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
+        y_lo, y_hi = int(h * 0.30), int(h * 0.95)
+        if tag and tag.get("z_m"):
+            # ★ new room (Sep 6, 12:36): a white door edge above the horizon was taken for the floor line. The
+            #   floor line is not "some dark edge": at range D it is horizon + f·h/D, to within a few pixels.
+            y_exp = _dock.get("horizon_y", DOCK["horizon_y"]) * h + fx0 * DOCK["cam_height_m"] / float(tag["z_m"])
+            y_lo = int(max(0, y_exp - 45)); y_hi = int(min(h - 1, y_exp + 45))
+        pts = []
         for x in range(8, w - 8, 8):
             prof = g[y_lo:y_hi, x - 3:x + 4].mean(axis=1); grad = np.diff(prof)
             yb = int(np.argmin(grad))
@@ -1699,7 +1706,7 @@ def dock_wall(img, cam="front"):
         if n < max(12, int(0.35 * len(P))):
             return {"phi": None, "why": "no consistent junction line", "n": len(P), "inliers": n}
         Q = P[inl]; A = np.vstack([Q[:, 0], np.ones(len(Q))]).T; sl, b = np.linalg.lstsq(A, Q[:, 1], rcond=None)[0]
-        fx = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
+        fx = fx0
         y_line = sl * (w / 2.0) + b
         dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
         if dy < 6:
