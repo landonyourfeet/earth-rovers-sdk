@@ -1332,7 +1332,7 @@ def dock_sense(jpeg):
 def _dock_find_mat_tag(gray, w):
     """The runway's own ArUco (ID 8) at the stand end of the mat. Returns its center x_err or None."""
     try:
-        corners, ids, _ = _ARUCO_DET.detectMarkers(gray)
+        corners, ids, _ = _aruco.detectMarkers(gray)
         if ids is None:
             return None
         for c, i in zip(corners, ids.ravel()):
@@ -1957,15 +1957,21 @@ async def _dock_stage_one(learner):
     for attempt in range(3):
         # 1. acquire: rotate in place only, until the tag is near the center of the frame
         _dock_set("stage1", "acquire - centering the tag by rotation only")
-        tag = None
+        # ★ (browser-session review, Sep 6): a 5% band is narrower than one ~6° pulse, and one dropped detection
+        #   used to rotate a lined-up rover. 8% band; two consecutive misses before a search pulse.
+        tag = None; missed = 0; last_tag = None
         for _ in range(24):
             see = await _dock_settled_look("front"); tag = see and see.get("tag")
-            if tag and abs(tag["x_err"]) <= 0.05:
-                break
             if tag:
+                missed = 0; last_tag = tag
+                if abs(tag["x_err"]) <= 0.08:
+                    break
                 await _dock_pulse_turn(learner.sign() * tag["x_err"], "front")
             else:
-                await _dock_pulse_turn(1, "front")
+                missed += 1
+                if missed >= 2:
+                    await _dock_pulse_turn(learner.sign() * (last_tag["x_err"] if last_tag and abs(last_tag["x_err"]) > 0.05 else 1.0), "front")
+        tag = tag or last_tag
         if not tag:
             return False
         # 2. measure once: three consistent reads of φ (wall), β (tag bearing), D (range)
