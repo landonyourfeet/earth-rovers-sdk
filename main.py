@@ -1154,7 +1154,13 @@ DOCK = {
     "rear_hfov_deg": float(os.getenv("DOCK_REAR_HFOV_DEG", "76")),   # run 14: rear read 0.32 m where the front had just staged at 0.69 m → same ~76° lens
     "stage_m": float(os.getenv("DOCK_STAGE_M", "0.6")),             # ★ Cap: turn around ~2 ft from the stand — use the sharp front camera all the way in
     "stage_tol_m": float(os.getenv("DOCK_STAGE_TOL_M", "0.2")),
-    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "8")),         # ★ Cap (run 18): only turn around when STRAIGHT ON with the tag
+    "yaw_ok_deg": float(os.getenv("DOCK_YAW_OK_DEG", "18")),        # ★ 10:56 PM: back to the tolerance that DOCKED this afternoon (runs 15-17); the rear stage fixes the rest
+    # ★ 10:56 PM (Cap: "drives forward, realizes it's wrong, backs up, makes it worse, three times, then ramps
+    #   the dock"). The axis/dogleg/go-around machinery loops on its own noise. It is now OFF by default:
+    #   the approach is the one that docked this afternoon - straight in, turn at two feet, back in, and let
+    #   the rear camera correct small offsets. The manoeuvring only wakes up for a GROSS angle (DOCK_AXIS_ONLY_ABOVE).
+    "axis_mode": os.getenv("DOCK_AXIS_MODE", "simple"),              # simple | full
+    "axis_only_above": float(os.getenv("DOCK_AXIS_ONLY_ABOVE", "28")),
     "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
     "axis_align_max": int(os.getenv("DOCK_AXIS_ALIGN_MAX", "6")),
     # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
@@ -2067,15 +2073,15 @@ async def _dock_stage_approach():
             rw = see.get("runway") if see else None
             if rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3 and abs(rw["yaw_deg"]) < 60:
                 yaw = rw["yaw_deg"]
-                if rw.get("lat") is not None:
-                    lat = rw["lat"] * max(0.5, z)   # bottom-of-frame offset scaled to metres-ish
+                # (the runway's bottom-of-frame offset is NOT a metres number - it stays out of `lat`)
             # yaw glitch filter: median of the last three readings
             yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-5]
             yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
             runway_ok = bool(rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3)
             if not runway_ok and abs(yaw_med) < 14:
                 yaw_med = 0.0   # tag-only yaw inside its own noise band is treated as straight
-            if abs(yaw_med) > DOCK["axis_align_yaw"] and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
+            axis_trigger = DOCK["axis_align_yaw"] if DOCK["axis_mode"] == "full" else DOCK["axis_only_above"]
+            if abs(yaw_med) > axis_trigger and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                 await _dock_send(0, 0)
                 if z < DOCK["axis_work_m"]:
@@ -2102,13 +2108,13 @@ async def _dock_stage_approach():
                     #   localizer - checked on EVERY frame where both tags decode, not just at the end.
                     al = see.get("align") if see else None
                     lined = ("lined up" if abs(al) <= DOCK["win_align"] else "NOT straight (mat tag %+.0f%% off)" % (al * 100)) if al is not None else "mat tag not readable yet"
-                    if al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    if DOCK["axis_mode"] == "full" and al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                         _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                         _dock_set("go_around", "not straight on final - mat tag %+.0f%% off the stand tag - going around" % (al * 100))
                         await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"])
                         await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=DOCK["axis_work_m"], lat_hint=al)
                         _dock["_yaw_hist"] = []; continue
-                    if z < 1.2 and al is None and (abs(yaw_med) > DOCK["yaw_ok_deg"] + 4 or abs(lat) > DOCK["final_go_around_lat"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    if DOCK["axis_mode"] == "full" and z < 1.2 and al is None and (abs(yaw_med) > DOCK["yaw_ok_deg"] + 4 or abs(lat) > DOCK["final_go_around_lat"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                         _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                         _dock_set("go_around", "off the localizer on final (yaw %+d°, %+.0f cm) - going around" % (yaw_med, lat * 100))
                         await _dock_send(0, 0); await _dock_retreat(learner, DOCK["axis_work_m"])
@@ -2121,8 +2127,8 @@ async def _dock_stage_approach():
                     await _dock_send(lin, ang)
                     _dock_log_tick("approach")
                     await asyncio.sleep(1.0 / DOCK["hz"]); continue
-                if abs(yaw_med) > DOCK["yaw_ok_deg"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
-                    # close, centered, but not straight on: get right back out to working distance, then crab
+                if abs(yaw_med) > (DOCK["yaw_ok_deg"] if DOCK["axis_mode"] == "full" else DOCK["axis_only_above"]) and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    # close, centered, but GROSSLY crooked: get right back out to working distance, then crab
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "at staging distance but %+d° off axis - backing out to square up" % yaw_med)
                     await _dock_retreat(learner, DOCK["axis_work_m"])
@@ -2130,7 +2136,7 @@ async def _dock_stage_approach():
                     _dock["_yaw_hist"] = []
                     continue
                 al = see.get("align") if see else None
-                if al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                if DOCK["axis_mode"] == "full" and al is not None and abs(al) > DOCK["win_align"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                     # the picture says NOT straight on (mat tag off to one side of the stand tag): fix it out at working distance
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "not straight on - mat tag %+.0f%% off the stand tag - backing out to square up" % (al * 100))
@@ -2138,7 +2144,7 @@ async def _dock_stage_approach():
                     await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=DOCK["axis_work_m"], lat_hint=al)
                     _dock["_yaw_hist"] = []
                     continue
-                if abs(yaw_med) > DOCK["yaw_ok_deg"] and al is None:
+                if abs(yaw_med) > DOCK["axis_only_above"]:
                     await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
                 await _dock_send(0, 0)
                 _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %+d° — turning" % (z, int(x_err * 100), yaw_med))
