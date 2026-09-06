@@ -1170,7 +1170,10 @@ DOCK = {
     "fwd": float(os.getenv("DOCK_FWD", "0.16")), "fwd_near": float(os.getenv("DOCK_FWD_NEAR", "0.10")),
     "rev": float(os.getenv("DOCK_REV", "0.12")), "rev_near": float(os.getenv("DOCK_REV_NEAR", "0.08")),
     "tag_turn_px": float(os.getenv("DOCK_TAG_TURN_PX", "90")),    # fallback (no pose): tag side px @640 when it's time to turn
-    "tag_m": float(os.getenv("DOCK_TAG_M", "0.1524")),              # printed tag side: 6 in
+    # ★ Sep 6 evening: the tag on the wall was MEASURED from the v2 PDF at 4.16 in, while this said 6 in - every range
+    #   the docker reported all day was 1.44× too far ("1.0 m" turn = 0.69 m real, which is why the tail hit the plate).
+    #   Flyer v3 prints the tag at 4.0 in. If a v2 sheet is still up, set DOCK_TAG_M=0.1057.
+    "tag_m": float(os.getenv("DOCK_TAG_M", "0.1016")),              # printed tag side: 4.0 in (flyer v3)
     # ★ run 13 (Cap: "stops way too far away, like 5 feet"): the log said 0.70 m while the rover was ~1.5 m
     #   out. Back-solving from the tag's pixel size (41 px @640 at 1.5 m) the FRONT lens is ~76° wide, not the
     #   110° I assumed - every front-camera distance was ~1.8× short. Front and rear now have their own FOV.
@@ -1712,21 +1715,24 @@ def _dock_wall_bar(g, w, h, fx, tag):
         side = float(tag["side_px"]) * (w / 640.0); cx = (tag["x_err"] + 0.5) * w; cy = tag["cy"] * h
         # the bar is ~1.7 tag-widths above the tag center (flyer layout), 1.6 in thick ≈ 0.27 tag widths
         y_c = cy - side * 1.85
-        y0 = int(max(0, y_c - side * 1.4)); y1 = int(min(h - 1, y_c + side * 0.9))
+        y0 = int(max(0, y_c - side * 1.6)); y1 = int(min(h - 1, y_c + side * 1.0))
         x0 = int(max(4, cx - side * 1.7)); x1 = int(min(w - 4, cx + side * 1.7))
         if y1 - y0 < 12 or x1 - x0 < 24:
             return None
         tops = []; bots = []
-        step = max(3, int((x1 - x0) / 24))
+        step = max(3, int((x1 - x0) / 28))
         for x in range(x0, x1, step):
             prof = g[y0:y1, x - 2:x + 3].mean(axis=1); grad = np.diff(prof)
             if len(grad) < 6:
                 continue
             i_top = int(np.argmin(grad))     # light → dark (top edge of the bar)
             i_bot = int(np.argmax(grad))     # dark → light (bottom edge)
-            if i_bot > i_top + 3 and -grad[i_top] > 25 and grad[i_bot] > 25 and (i_bot - i_top) < side * 0.6:
+            # ★ the bar fired on standing frames and vanished on moving ones: motion blur softens the edges
+            #   below a fixed 25-level step. Threshold on THIS column's contrast instead.
+            thr = max(9.0, 0.3 * float(prof.max() - prof.min()))
+            if i_bot > i_top + 3 and -grad[i_top] > thr and grad[i_bot] > thr and (i_bot - i_top) < side * 0.6:
                 tops.append((x, y0 + i_top)); bots.append((x, y0 + i_bot))
-        if len(tops) < 6:
+        if len(tops) < 5:
             return None
         def fit(pts):
             P = np.array(pts, dtype=np.float64); A = np.vstack([P[:, 0], np.ones(len(P))]).T
@@ -1746,7 +1752,7 @@ def _dock_wall_bar(g, w, h, fx, tag):
 
 def _dock_wall_from_high_only(g, w, h, fx, why_floor, tag=None):
     hi = _dock_wall_bar(g, w, h, fx, tag) or _dock_wall_high_line(g, w, h, fx)
-    if hi and abs(hi["dy"]) >= 40:
+    if hi and abs(hi["dy"]) >= 40 and (hi.get("bar") or hi["q"] >= 0.6):
         sl_c = hi["slope"] - _dock.get("wall_slope_bias_high", DOCK["wall_slope_bias"])
         phi = -math.degrees(math.atan(sl_c * fx / hi["dy"]))
         return {"phi": round(float(phi), 1), "src": "bar" if hi.get("bar") else "high", "raw": round(float(-math.degrees(math.atan(hi["slope"] * fx / hi["dy"]))), 1), "slope": hi["slope"], "dy": hi["dy"], "q": hi["q"], "floor": None, "high": hi, "note": why_floor}
@@ -1803,7 +1809,7 @@ def dock_wall(img, cam="front", tag=None):
         if abs(dy) >= 40:
             cands.append(("floor", sl, dy, low["q"]))
         hi = _dock_wall_bar(g, w, h, fx0, tag) or _dock_wall_high_line(g, w, h, fx0)
-        if hi and abs(hi["dy"]) >= 40:
+        if hi and abs(hi["dy"]) >= 40 and (hi.get("bar") or hi["q"] >= 0.6):
             cands.append(("bar" if hi.get("bar") else "high", hi["slope"], hi["dy"], hi["q"]))
         if not cands:
             return {"phi": None, "why": "no wall line far enough from the horizon (floor dy %d%s)" % (round(float(dy)), (", high dy %d" % hi["dy"]) if hi else ""), "floor": low, "high": hi}
@@ -2702,7 +2708,7 @@ async def _dock_stage_approach():
                     #   2.3 m - the rover drifts, and a 5% tag deadband hides it until the turn is hopeless. On final the
                     #   heading is held on the wall reading (live, every frame) plus a tight 2% tag deadband.
                     wl = see.get("wall") if see else None
-                    phi_live = wl.get("phi") if (wl and wl.get("phi") is not None and (wl.get("q") or 0) >= DOCK["wall_q_min"]) else None
+                    phi_live = wl.get("phi") if (wl and wl.get("phi") is not None and wl.get("src") in ("bar", "floor") and (wl.get("q") or 0) >= 0.6) else None
                     ang = 0.0 if abs(x_err) < 0.02 else learner.sign() * x_err * DOCK["turn_gain"]
                     if phi_live is not None and abs(phi_live) > 3:
                         ang += (-phi_live / 40.0) * _dock.get("_wall_steer_sign", 1)
