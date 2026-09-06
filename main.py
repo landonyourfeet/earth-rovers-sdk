@@ -1161,6 +1161,10 @@ DOCK = {
     #   the rear camera correct small offsets. The manoeuvring only wakes up for a GROSS angle (DOCK_AXIS_ONLY_ABOVE).
     "axis_mode": os.getenv("DOCK_AXIS_MODE", "simple"),              # simple | full
     "axis_only_above": float(os.getenv("DOCK_AXIS_ONLY_ABOVE", "28")),
+    # Tag-pose yaw noise scales with tag size: at 37 px it swung -8/-19/-25/-3/-21° in six seconds while the
+    # rover sat dead straight. Yaw inside DOCK_YAW_NOISE_K / side_px is treated as ZERO, and any manoeuvre
+    # needs three consecutive readings outside that band. Unmeasurable = straight in, never "assume crooked".
+    "yaw_noise_k": float(os.getenv("DOCK_YAW_NOISE_K", "900")),
     "axis_align_yaw": float(os.getenv("DOCK_AXIS_ALIGN_YAW", "10")), # start crabbing onto the dock axis above this yaw
     "axis_align_max": int(os.getenv("DOCK_AXIS_ALIGN_MAX", "6")),
     # ★ Cap (run 19): "it's getting way too close before it realizes it's off center - then the docking
@@ -2078,8 +2082,15 @@ async def _dock_stage_approach():
             yaw_hist = _dock.setdefault("_yaw_hist", []); yaw_hist.append(yaw); del yaw_hist[:-5]
             yaw_med = sorted(yaw_hist)[len(yaw_hist) // 2]
             runway_ok = bool(rw and rw.get("yaw_deg") is not None and rw.get("vps", 0) >= 3)
-            if not runway_ok and abs(yaw_med) < 14:
-                yaw_med = 0.0   # tag-only yaw inside its own noise band is treated as straight
+            noise = DOCK["yaw_noise_k"] / max(20.0, float(tag.get("side_px") or 20))
+            if not runway_ok:
+                if abs(yaw_med) < max(14.0, noise):
+                    yaw_med = 0.0   # tag-only yaw inside its size-scaled noise band is treated as straight
+                # ...and a real angle must persist: three consecutive readings outside the band
+                outs = _dock.setdefault("_yaw_out_n", 0)
+                _dock["_yaw_out_n"] = outs + 1 if yaw_med != 0.0 else 0
+                if _dock["_yaw_out_n"] < 3:
+                    yaw_med = 0.0
             axis_trigger = DOCK["axis_align_yaw"] if DOCK["axis_mode"] == "full" else DOCK["axis_only_above"]
             if abs(yaw_med) > axis_trigger and abs(x_err) < 0.2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"]:
                 _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
@@ -2414,7 +2425,9 @@ async def _dock_final(z_from: float):
                 _dock_log_tick("final", "seat pulse dx=%+.2f" % dx)
                 continue
             else:
-                ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else -DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
+                # steering while creeping uses the SAME sign as the centering pulse above (it was inverted:
+                # between 3% and 8% off the marks it pushed itself further off every tick)
+                ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
                 await _dock_send(-DOCK["seat_creep"], ang); moving_cmd = True; _dock_set("final", "seating - creeping to the stand · width %.2f · offset %+.0f%%" % (seat["width"], dx * 100))
         else:
             await _dock_send(-DOCK["rev_final"], 0.0); moving_cmd = True; _dock_set("final", "rolling back - waiting for the sheet to fill the frame")
@@ -2732,7 +2745,15 @@ async def _dock_loop():
     _dock_set("acquire")
     try:
         if not await browser_service.has_rear_camera():
-            _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
+            # the Agora rear track sometimes attaches a few seconds after the front one - wait for it
+            _dock_set("wait", "waiting for the rear camera to attach")
+            ok = False
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                if await browser_service.has_rear_camera():
+                    ok = True; break
+            if not ok:
+                _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
         ap = await _dock_stage_approach()
         if not ap:
             return
