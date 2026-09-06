@@ -1937,6 +1937,7 @@ async def _dock_stage_one(learner):
     back to the old approach, None on honest failure."""
     fx = (1024 / 2.0) / math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)   # per 1024-px frame; x_err is normalized
     def bearing(x_err): return math.degrees(math.atan(x_err * 2 * math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)))
+    F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
     for attempt in range(3):
         # 1. acquire: rotate in place only, until the tag is near the center of the frame
         _dock_set("stage1", "acquire - centering the tag by rotation only")
@@ -1987,7 +1988,6 @@ async def _dock_stage_one(learner):
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "sensors disagree at the fix - not going in"); return None
             continue
         # already at the fix?
-        F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
         if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.4:
             _dock_set("stage1", "at the fix: %.0f cm beside the axis, φ %+.0f° - lined up" % (lat * 100, phi)); return True
         # 3. plan once: turn to face the fix point, drive there, turn to face the wall
