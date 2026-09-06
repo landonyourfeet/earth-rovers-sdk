@@ -1996,8 +1996,16 @@ async def _dock_stage_one(learner):
         vx, vy = 0.0 - xr, F - yr
         dist = math.hypot(vx, vy)
         heading_world = math.radians(phi)                                        # current heading from "toward the wall"
-        want = math.degrees(math.atan2(-vx, -vy))                                # world angle of the vector to the fix, same convention
+        # heading convention: h = (sin θ, -cos θ), θ = 0 facing the wall, right-positive → θ = atan2(vx, -vy)
+        #   (run 16:39 measured the geometry correctly - 1.74 m beside, 1.91 m out - then planned +152° where
+        #    the vector to the fix needs -71°; the sign of vx was flipped in this line)
+        want = math.degrees(math.atan2(vx, -vy))
         turn1 = ((want - phi + 540) % 360) - 180                                  # right-positive
+        if dist > 2.5 or abs(lat) > 2.2:
+            _docklog_event("stage1", "plan rejected: %.2f m leg / %.2f m beside the axis is not credible from %.2f m range - re-measuring (%d/3)" % (dist, lat, D, attempt + 1))
+            if attempt >= 2:
+                await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "measurements never produced a credible plan - not going in"); return None
+            continue
         _dock_set("stage1", "plan: turn %+.0f°, drive %.2f m, square up (fix %.1f m out)" % (turn1, dist, F))
         _docklog_event("stage1", "plan: turn %+.0f°, drive %.2f m, then square to the wall" % (turn1, dist))
         # execute turn 1 by watching the tag bearing when it stays in view, else by pulse count
