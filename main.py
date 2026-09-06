@@ -1128,6 +1128,7 @@ DOCK = {
     "xmark_depth_m": float(os.getenv("DOCK_XMARK_DEPTH_M", "0.15")), # how far BEHIND the tag plane the X sits
     "wall_bias": float(os.getenv("DOCK_WALL_BIAS", "0")),            # (legacy) residual angle; superseded by wall_slope_bias
     "wall_slope_bias": float(os.getenv("DOCK_WALL_SLOPE_BIAS", "0")),  # the junction's image slope when parked square (camera roll) - ZERO sets it
+    "wall_slope_bias_high": float(os.getenv("DOCK_WALL_SLOPE_BIAS_HIGH", "0")),  # same, for the high wall line
     # ★ the wall angle is atan(slope · f / dy) where dy is the junction's drop below the HORIZON. The lens does not
     #   look exactly level, so the horizon is not the image center: ZERO calibrates it from the fix distance and
     #   the camera height (dy_expected = f·h/D). With the image center used instead, dy read 9 px at 3.3 m and the
@@ -1668,6 +1669,38 @@ def dock_xmark(img, tag, w, h):
         return {"off": None, "why": "error: " + str(e)[:80]}
 
 
+def _dock_wall_high_line(g, w, h, fx):
+    """A long near-horizontal edge high on the wall (ceiling line, window sill, door top): RANSAC over
+    strong vertical gradients in the upper 45% of the frame. Returns slope / dy / quality or None."""
+    try:
+        y_lo, y_hi = int(h * 0.04), int(h * 0.46); pts = []
+        for x in range(8, w - 8, 8):
+            prof = g[y_lo:y_hi, x - 3:x + 4].mean(axis=1); grad = np.abs(np.diff(prof))
+            yb = int(np.argmax(grad))
+            if grad[yb] > 10:
+                pts.append((x, y_lo + yb))
+        if len(pts) < 24:
+            return None
+        P = np.array(pts, dtype=np.float64); best = None; rng = np.random.default_rng(11)
+        for _ in range(300):
+            i, j = rng.choice(len(P), 2, replace=False)
+            if abs(P[j, 0] - P[i, 0]) < w * 0.2:
+                continue
+            sl = (P[j, 1] - P[i, 1]) / (P[j, 0] - P[i, 0]); b = P[i, 1] - sl * P[i, 0]
+            if abs(sl) > 0.35:
+                continue
+            inl = np.abs(P[:, 1] - (sl * P[:, 0] + b)) < 3.0
+            if best is None or inl.sum() > best[0]:
+                best = (int(inl.sum()), inl)
+        if best is None or best[0] < max(14, int(0.3 * len(P))):
+            return None
+        Q = P[best[1]]; A = np.vstack([Q[:, 0], np.ones(len(Q))]).T; sl, b = np.linalg.lstsq(A, Q[:, 1], rcond=None)[0]
+        y_line = sl * (w / 2.0) + b; dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
+        return {"slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": best[0], "of": len(P), "q": round(best[0] / float(len(P)), 2)}
+    except Exception:
+        return None
+
+
 def dock_wall(img, cam="front", tag=None):
     """★ Sep 6 (Cap taped the tag flat on the wall, so the dock axis IS the wall normal; the browser
     session's plan: measure the WALL, not the tag). The wall-floor junction runs the full width of the
@@ -1709,11 +1742,23 @@ def dock_wall(img, cam="front", tag=None):
         fx = fx0
         y_line = sl * (w / 2.0) + b
         dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
-        if dy < 6:
-            return {"phi": None, "why": "junction too near the horizon", "dy": round(float(dy)), "y_line": round(float(y_line)), "slope": round(float(sl), 4)}
-        sl_c = sl - _dock.get("wall_slope_bias", DOCK["wall_slope_bias"])
-        phi = -math.degrees(math.atan(sl_c * fx / dy))
-        return {"phi": round(float(phi), 1), "raw": round(float(-math.degrees(math.atan(sl * fx / dy))), 1), "slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
+        low = {"slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
+        # ★ Sep 6 evening (new room): the floor line landed 6 px from the horizon and atan(slope·f/dy) turned a
+        #   stable -7° raw into +66.9°. Near the horizon the conversion is SINGULAR, not just weak. Two answers:
+        #   gate it (|dy| < 40 → not measurable), and read a HIGH wall line too - ceiling, sill, door top - where
+        #   |dy| is 100+ px and the same formula is well conditioned. Whichever line is better conditioned wins.
+        cands = []
+        if abs(dy) >= 40:
+            cands.append(("floor", sl, dy, low["q"]))
+        hi = _dock_wall_high_line(g, w, h, fx0)
+        if hi and abs(hi["dy"]) >= 40:
+            cands.append(("high", hi["slope"], hi["dy"], hi["q"]))
+        if not cands:
+            return {"phi": None, "why": "no wall line far enough from the horizon (floor dy %d%s)" % (round(float(dy)), (", high dy %d" % hi["dy"]) if hi else ""), "floor": low, "high": hi}
+        src, sl_u, dy_u, q_u = max(cands, key=lambda c: abs(c[2]) * c[3])
+        sl_c = sl_u - (_dock.get("wall_slope_bias", DOCK["wall_slope_bias"]) if src == "floor" else _dock.get("wall_slope_bias_high", DOCK["wall_slope_bias"]))
+        phi = -math.degrees(math.atan(sl_c * fx / dy_u))
+        return {"phi": round(float(phi), 1), "src": src, "raw": round(float(-math.degrees(math.atan(sl_u * fx / dy_u))), 1), "slope": round(float(sl_u), 4), "dy": round(float(dy_u)), "q": round(float(q_u), 2), "floor": low, "high": hi}
     except Exception as e:
         return {"phi": None, "why": "error: " + str(e)[:80]}
 
@@ -3422,10 +3467,12 @@ async def dock_post(request: Request):
                 outz["warning"] = "that slope would be %+.0f° - either the rover was not square to the wall, or the camera is rolled; if it was square this is fine" % phi0
         elif wl and wl.get("raw") is not None:
             _dock["wall_bias"] = float(wl["raw"]); outz["wall_bias"] = wl["raw"]
+        if wl and isinstance(wl.get("high"), dict) and wl["high"].get("slope") is not None:
+            _dock["wall_slope_bias_high"] = float(wl["high"]["slope"]); outz["wall_slope_bias_high"] = round(float(wl["high"]["slope"]), 4)
         xmd = see.get("xmark") if see else None
         if isinstance(xmd, dict) and xmd.get("off") is not None:
             _dock["xmark_bias"] = float(xmd["off"]); outz["xmark_bias"] = xmd["off"]
-        logger.info("dock: ZEROED %s → set DOCK_WALL_SLOPE_BIAS=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_slope_bias"), outz.get("horizon_y"), outz.get("xmark_bias"))
+        logger.info("dock: ZEROED %s → set DOCK_WALL_SLOPE_BIAS=%s DOCK_WALL_SLOPE_BIAS_HIGH=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_slope_bias"), outz.get("wall_slope_bias_high"), outz.get("horizon_y"), outz.get("xmark_bias"))
         _docklog_event("zero", "zeroed: %s" % outz)
         return outz
     if action == "set_fix":
