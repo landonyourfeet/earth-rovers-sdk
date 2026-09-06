@@ -1122,6 +1122,8 @@ DOCK = {
     #   rover at 37 px @1.69 m read -8.5/-18.7/-25/-2.8/-20.7° in six seconds. solvePnP on a small square is
     #   dominated by corner quantisation, so the yaw noise goes as 1/size: roughly K/side_px degrees.
     "yaw_noise_k": float(os.getenv("DOCK_YAW_NOISE_K", "900")),
+    "xmark_off": float(os.getenv("DOCK_XMARK_OFF", "0.35")),          # wall X this many tag-widths off the tag = off the axis
+    "xmark_ok": float(os.getenv("DOCK_XMARK_OK", "0.2")),             # X stacked within this = straight on
     "yaw_runway_noise": float(os.getenv("DOCK_YAW_RUNWAY_NOISE", "4")),
     # Cap, run 6: "almost - off center just slightly; it must be perfectly centered to charge, and it should
     #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
@@ -1230,6 +1232,7 @@ def _docklog_tick(stage, cam, see, linear, angular, note=None):
         "sheet": ({k: sheet.get(k) for k in ("x_err", "ratio", "cy")} if sheet else None),
         "lane_err": see.get("lane_err") if see else None,
         "runway": (see.get("runway") if see else None),
+        "xmark": (see.get("xmark") if see else None),
         "hdg": _dock_heading(), "rpms0": _dock_rpms_zero(), "bat": d.get("battery"), "v": d.get("voltage"), "i": d.get("current"), "pw": d.get("power"), "spd": d.get("speed"), "note": note,
     })
 def _docklog_snap(label, jpeg):
@@ -1389,6 +1392,11 @@ def dock_see(jpeg: bytes, cam: str):
                 if "yaw_deg" in t: t["yaw_deg"] = round(-t["yaw_deg"], 1)
                 if "stage_bearing_deg" in t: t["stage_bearing_deg"] = round(-t["stage_bearing_deg"], 1)
             t["x_err"] = round(t["cx"] - 0.5, 3); t["mirrored"] = flipped
+            if cam == "front":
+                try:
+                    out["xmark"] = dock_xmark(img, t, w, h)   # the wall X, in tag widths right of the tag
+                except Exception:
+                    out["xmark"] = None
             if _dock["mirror"].get(cam) is None:
                 _dock["mirror"][cam] = flipped; logger.info("dock: %s camera is %s", cam, "MIRRORED" if flipped else "not mirrored")
                 _docklog_event("mirror", "%s camera is %s" % (cam, "MIRRORED" if flipped else "not mirrored"))
@@ -1588,6 +1596,41 @@ def dock_runway(jpeg: bytes, cam: str = "front"):
     # the centerline's near end: the widest dark run in the lowest rows where the mat is present
     near_x = lat
     return {"yaw_deg": round(yaw, 1), "vp_x": round(vx / w - 0.5, 3), "vp_y": round(vy / h, 3), "lat": lat, "near_x": near_x, "lines": len(lines), "vps": len(vps)}
+
+
+def dock_xmark(img, tag, w, h):
+    """★ Sep 6 (Cap taped a magenta sheet with a big black X on the wall above the backboard): a second
+    marker on the dock's centerline at a different DEPTH. On the axis the X sits directly above the tag;
+    off-axis it slides sideways - like a rifle's rear sight over the front sight. The X is behind the tag,
+    so: X right of the tag → rover is RIGHT of the axis → move LEFT. Returns the X's horizontal offset in
+    tag widths (+ = right of the tag), or None. Reads from 3 m, needs no decoding, no colour, no pose."""
+    try:
+        cx = (tag["x_err"] + 0.5) * w; side = float(tag.get("side_px") or 0) * (w / 640.0)
+        if side < 8:
+            return None
+        cy = tag.get("cy")
+        if cy is None:
+            return None
+        cy = cy * h
+        y0 = int(max(0, cy - side * 4.2)); y1 = int(max(0, cy - side * 0.9))
+        x0 = int(max(0, cx - side * 2.2)); x1 = int(min(w, cx + side * 2.2))
+        if y1 - y0 < 8 or x1 - x0 < 8:
+            return None
+        roi = img[y0:y1, x0:x1]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        dark = cv2.inRange(hsv, (0, 0, 0), (180, 255, 90))
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        cs, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cs = [c for c in cs if cv2.contourArea(c) >= (side * 0.35) ** 2]
+        if not cs:
+            return None
+        c = max(cs, key=cv2.contourArea); m = cv2.moments(c)
+        if not m["m00"]:
+            return None
+        xc = x0 + m["m10"] / m["m00"]
+        return round(float((xc - cx) / side), 3)
+    except Exception:
+        return None
 
 
 def dock_led_green(jpeg: bytes):
@@ -1909,7 +1952,11 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         #   (a) if the mat is readable, its centerline's near end lies on the side the dock axis runs toward -
         #   that is the side to move to; (b) otherwise the side the dock sits on in the frame. Never the yaw.
         al0 = see0.get("align") if see0 else None
-        if al0 is not None and abs(al0) > 0.015:
+        xm0 = see0.get("xmark") if see0 else None
+        if xm0 is not None and abs(xm0) >= 0.15:
+            side = -1 if xm0 > 0 else 1        # X right of the tag → we are right of the axis → move LEFT
+            _docklog_event("crab", "side from the wall X: %+.2f tag-widths → move %s" % (xm0, "RIGHT" if side > 0 else "LEFT"))
+        elif al0 is not None and abs(al0) > 0.015:
             side = 1 if al0 > 0 else -1
             _docklog_event("crab", "side from the two tags: mat tag %+.3f off the stand tag → %+d" % (al0, side))
         elif rw0 and rw0.get("near_x") is not None and rw0.get("vps", 0) >= 3 and abs(rw0["near_x"] - x0) > 0.04:
@@ -2153,6 +2200,17 @@ async def _dock_stage_approach():
             # where axis work happens: Cap's 1.5 m fix when the mat lines carry the yaw, otherwise only as
             # far out as the tag can still be measured
             awm = DOCK["axis_work_m"] if runway_ok else DOCK["axis_work_tag_m"]
+            # ★ the wall X (rear sight over the front sight): a few consistent readings of the X sitting to one
+            #   side of the tag is a side-of-axis measurement from any distance. It outranks the tag's yaw.
+            xm = see.get("xmark") if see else None
+            xh = _dock.setdefault("_xmark_hist", [])
+            if xm is not None:
+                xh.append(xm); del xh[:-5]
+            xmark_med = sorted(xh)[len(xh) // 2] if len(xh) >= 3 else None
+            xmark_off = xmark_med is not None and abs(xmark_med) >= DOCK["xmark_off"] and all((v > 0) == (xmark_med > 0) for v in xh)
+            if xmark_off and not yaw_ok:
+                # the X says we are off the axis even though the tag's yaw can't be trusted - treat it as a real angle
+                yaw_ok = True; yaw_med = (-1 if xmark_med > 0 else 1) * max(DOCK["axis_align_yaw"] + 1, abs(xmark_med) * 12.0)
             # ★ "close to measure": with no solid yaw beyond ~1.3 m, drive straight until the tag is big enough,
             #   then STOP and take a proper reading (several settled looks) before deciding anything. "Get
             #   closer" and "may manoeuvre" used to be the same threshold, so the decision always came too late.
@@ -2225,6 +2283,14 @@ async def _dock_stage_approach():
                     await _dock_retreat(learner, awm)
                     await _dock_axis_crab(learner, max(abs(yaw_med), 12) * (1 if al > 0 else -1), z0=awm, lat_hint=al)
                     _dock["_yaw_hist"] = []
+                    continue
+                xm_now = see.get("xmark") if see else None
+                if xm_now is not None and abs(xm_now) > DOCK["xmark_ok"] and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
+                    _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
+                    _dock_set("axis", "not straight on - wall X %+.2f tag-widths off the tag - backing out to square up" % xm_now)
+                    await _dock_retreat(learner, awm)
+                    await _dock_axis_crab(learner, (-1 if xm_now > 0 else 1) * max(12, abs(xm_now) * 12.0), z0=awm, lat_hint=None)
+                    _dock["_yaw_hist"] = []; _dock["_xmark_hist"] = []
                     continue
                 if yaw_ok and abs(yaw_med) > DOCK["yaw_ok_deg"] and al is None:
                     await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
@@ -2839,7 +2905,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": []})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
