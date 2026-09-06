@@ -1126,7 +1126,13 @@ DOCK = {
     "xmark_ok": float(os.getenv("DOCK_XMARK_OK", "0.08")),            # X stacked within this = straight on
     "xmark_bias": float(os.getenv("DOCK_XMARK_BIAS", "0")),          # build bias: X not perfectly over the tag (zero it: /dock zero_xmark)
     "xmark_depth_m": float(os.getenv("DOCK_XMARK_DEPTH_M", "0.15")), # how far BEHIND the tag plane the X sits
-    "wall_bias": float(os.getenv("DOCK_WALL_BIAS", "0")),            # baseboard slope reading when parked square (zero it)
+    "wall_bias": float(os.getenv("DOCK_WALL_BIAS", "0")),            # residual wall angle when parked square (zero it)
+    # ★ the wall angle is atan(slope · f / dy) where dy is the junction's drop below the HORIZON. The lens does not
+    #   look exactly level, so the horizon is not the image center: ZERO calibrates it from the fix distance and
+    #   the camera height (dy_expected = f·h/D). With the image center used instead, dy read 9 px at 3.3 m and the
+    #   angle blew up to -73°.
+    "cam_height_m": float(os.getenv("DOCK_CAM_HEIGHT_M", "0.12")),   # camera lens above the wall-floor junction
+    "horizon_y": float(os.getenv("DOCK_HORIZON_Y", "0.5")),          # horizon row as a fraction of frame height (ZERO sets it)
     "wall_q_min": float(os.getenv("DOCK_WALL_Q_MIN", "0.5")),        # RANSAC inlier ratio needed to trust the wall
     "fix_m": float(os.getenv("DOCK_FIX_M", "2.3")),                  # the fix: this far out on the axis (SET FIX captures the tag size there)
     "fix_side_px": float(os.getenv("DOCK_FIX_SIDE_PX", "0")),        # captured tag size at the fix (0 = derive from fix_m)
@@ -1692,11 +1698,12 @@ def dock_wall(img, cam="front"):
             return {"phi": None, "why": "no consistent junction line", "n": len(P), "inliers": n}
         Q = P[inl]; A = np.vstack([Q[:, 0], np.ones(len(Q))]).T; sl, b = np.linalg.lstsq(A, Q[:, 1], rcond=None)[0]
         fx = (w / 2.0) / math.tan(math.radians(DOCK["rear_hfov_deg"] if cam == "rear" else DOCK["hfov_deg"]) / 2.0)
-        dy = (sl * (w / 2.0) + b) - h / 2.0
-        if dy < 8:
-            return {"phi": None, "why": "junction too near the horizon", "dy": round(float(dy))}
+        y_line = sl * (w / 2.0) + b
+        dy = y_line - _dock.get("horizon_y", DOCK["horizon_y"]) * h
+        if dy < 6:
+            return {"phi": None, "why": "junction too near the horizon", "dy": round(float(dy)), "y_line": round(float(y_line)), "slope": round(float(sl), 4)}
         phi = -math.degrees(math.atan(sl * fx / dy))
-        return {"phi": round(float(phi - _dock.get("wall_bias", DOCK["wall_bias"])), 1), "raw": round(float(phi), 1), "slope": round(float(sl), 4), "dy": round(float(dy)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
+        return {"phi": round(float(phi - _dock.get("wall_bias", DOCK["wall_bias"])), 1), "raw": round(float(phi), 1), "slope": round(float(sl), 4), "dy": round(float(dy)), "y_line": round(float(y_line)), "inliers": n, "of": len(P), "q": round(n / float(len(P)), 2)}
     except Exception as e:
         return {"phi": None, "why": "error: " + str(e)[:80]}
 
@@ -1967,7 +1974,7 @@ async def _dock_stage_one(learner):
         if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15:
             _docklog_event("stage1", "two sensors disagree on the side - not planning on either; falling back"); return False
         # already at the fix?
-        F = DOCK["fix_m"]
+        F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
         if abs(lat) <= DOCK["fix_lat_m"] and abs(phi) <= DOCK["fix_phi_deg"] and abs(yr - F) <= 0.4:
             _dock_set("stage1", "at the fix: %.0f cm beside the axis, φ %+.0f° - lined up" % (lat * 100, phi)); return True
         # 3. plan once: turn to face the fix point, drive there, turn to face the wall
@@ -2305,13 +2312,6 @@ async def _dock_stage_approach():
     learner = _SignLearner("front"); search_dir = 1.0; faced_since = None; sheet_big_since = None
     # ★ stage one first: measure the wall, plan once, fly to the fix. Passed → the axis is settled for this
     #   attempt; the old approach only trims from here. Fallback → the old approach as before.
-    if not _dock.get("_stage1_done"):
-        _dock["_stage1_done"] = True
-        r1 = await _dock_stage_one(learner)
-        if r1 is None:
-            return False
-        if r1:
-            _dock["_sight_seen"] = True; _dock["_stage1_pass"] = True
     while True:
         now = time.time()
         if now - _dock["started_at"] > DOCK["timeout_s"]:
@@ -2426,6 +2426,22 @@ async def _dock_stage_approach():
             # ★ "close to measure": with no solid yaw beyond ~1.3 m, drive straight until the tag is big enough,
             #   then STOP and take a proper reading (several settled looks) before deciding anything. "Get
             #   closer" and "may manoeuvre" used to be the same threshold, so the decision always came too late.
+            # ★ the FIX is where stage one happens: the wall reader only works from about the fix distance in
+            #   (the junction sits too near the horizon farther out), so `closing` drives straight to the fix -
+            #   tag at fix_side_px, or z at fix_m - halts, and stage one measures/plans/verifies THERE.
+            at_fix = (DOCK["fix_side_px"] > 0 and tag["side_px"] >= DOCK["fix_side_px"] * 0.95) or z <= DOCK["fix_m"] * 1.05
+            if not _dock.get("_stage1_done") and not at_fix:
+                ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
+                await _dock_send(DOCK["fwd"], ang); _dock_set("closing", "closing to the fix · %.2f m · tag %.0f px (fix %.0f px)" % (z, tag["side_px"], DOCK["fix_side_px"] or 0))
+                _dock_log_tick("approach", "closing"); await asyncio.sleep(1.0 / DOCK["hz"]); continue
+            if not _dock.get("_stage1_done"):
+                await _dock_send(0, 0); _dock["_stage1_done"] = True
+                r1 = await _dock_stage_one(learner)
+                if r1 is None:
+                    return False
+                if r1:
+                    _dock["_sight_seen"] = True; _dock["_stage1_pass"] = True
+                continue
             if not yaw_ok and z > 1.3 and not _dock.get("_measured_once"):
                 if z > 1.35:
                     ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
@@ -3283,13 +3299,24 @@ async def dock_post(request: Request):
         # parked square on the axis, looking at the dock: the wall slope and the X offset read now are build bias
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None
         outz = {"ok": True}
-        wl = see.get("wall") if see else None
-        if wl and wl.get("raw") is not None:
+        wl = see.get("wall") if see else None; t = see and see.get("tag")
+        if wl and wl.get("y_line") is not None and t and t.get("z_m"):
+            fr2 = await _dock_frame("front"); img2 = cv2.imdecode(np.frombuffer(fr2.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR) if fr2 else None
+            hh, ww = (img2.shape[:2] if img2 is not None else (576, 1024))
+            fx = (ww / 2.0) / math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)
+            dy_expected = fx * DOCK["cam_height_m"] / float(t["z_m"])
+            _dock["horizon_y"] = float((wl["y_line"] - dy_expected) / hh)
+            outz["horizon_y"] = round(_dock["horizon_y"], 4); outz["dy_expected"] = round(dy_expected, 1); outz["y_line"] = wl["y_line"]
+            phi0 = -math.degrees(math.atan(wl["slope"] * fx / max(6.0, dy_expected)))
+            _dock["wall_bias"] = float(phi0); outz["wall_bias"] = round(phi0, 1)
+            if abs(phi0) > 12:
+                outz["warning"] = "residual %+.0f° is large - was the rover square to the wall? (or DOCK_CAM_HEIGHT_M is off)" % phi0
+        elif wl and wl.get("raw") is not None:
             _dock["wall_bias"] = float(wl["raw"]); outz["wall_bias"] = wl["raw"]
         xmd = see.get("xmark") if see else None
         if isinstance(xmd, dict) and xmd.get("off") is not None:
             _dock["xmark_bias"] = float(xmd["off"]); outz["xmark_bias"] = xmd["off"]
-        logger.info("dock: ZEROED %s → set DOCK_WALL_BIAS=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_bias"), outz.get("xmark_bias"))
+        logger.info("dock: ZEROED %s → set DOCK_WALL_BIAS=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_bias"), outz.get("horizon_y"), outz.get("xmark_bias"))
         _docklog_event("zero", "zeroed: %s" % outz)
         return outz
     if action == "set_fix":
