@@ -1606,6 +1606,13 @@ def dock_led_green(jpeg: bytes):
     return {"frac": round(frac, 4), "blob": round(biggest, 4), "lit": bool(biggest >= 0.002)}
 
 
+def _dock_speed_zero() -> bool:
+    try:
+        return abs(float((telemetry_hub.latest or {}).get("speed") or 0.0)) <= 0.05
+    except Exception:
+        return False
+
+
 def _dock_rpms_zero() -> bool:
     d = telemetry_hub.latest or {}
     rp = d.get("rpms") or []
@@ -2410,7 +2417,7 @@ async def _dock_stage_back():
             linear = -(DOCK["rev_near"] if near else DOCK["rev"])
             _dock_set("back", "backing onto the mat · " + ref)
             rev_since = rev_since or now
-            if now - rev_since > DOCK["stall_s"] and _dock_rpms_zero():
+            if now - rev_since > DOCK["stall_s"] and (_dock_rpms_zero() or _dock_speed_zero()):
                 # ★ run 7 log: "docked - wheels stalled" fired 50 cm from the sheet, turned 45°, stuck on the
                 #   mat edge. A stall only counts at the stand: the sheet must be filling the frame.
                 seat = dock_seat(fr.jpeg) if fr else None
@@ -2444,59 +2451,71 @@ def linear_cmd_reverse(cmd):
 
 
 async def _dock_final(z_from: float):
-    """Sep 5 (Cap: "rolling back very slowly until it receives charge - that's when it
-    knows it's arrived"). The tag is gone from the rear frame because we are inside
-    its field of view; roll straight back at DOCK_REV_FINAL until the wheels stall or
-    the cap, then hold and watch the battery. Rising battery = docked and charging.
-    No rise after DOCK_CHARGE_WAIT_S -> one more push, wait again, then report."""
+    """★ Sep 6 morning (log 20260906-125508, analysed by Cap's browser session): the rover reached the
+    stand PERFECTLY lined up (lat -0.01, yaw 0°) and then lost it in the last 40 cm, because:
+      1. seat_ref was null, so it chased placeholder targets (width 1.00) that do not exist in this room;
+      2. it steered on an unstable white blob for 20 s, pinned against the stand, scrubbing sideways;
+      3. the last command [-0.09, +0.15] was never cancelled on the stage exit - it arced for 11 s;
+      4. a timeout was treated as a win, then 158 s of watching for a charge that could not come.
+    The honest final: at tag loss the geometry is known (that is why the tag was allowed to leave the
+    frame) - FREEZE the heading, roll straight back the remaining distance with ZERO angular, stop on a
+    real stall (speed, not rpm flags), send an explicit stop, wait until the rover is still, then judge.
+    Seat marks only ever CORRECT a drift (a few pulses, then straight again); they never set the depth
+    unless a live calibration exists."""
     _dock["_seat_hist"] = []
-    _dock_set("final", "tag out of view at %.2f m - seating on the coil by frame geometry" % z_from)
     ref = _dock.get("seat_ref") or {}
-    t0 = time.time(); stalled = False; seated = None; tw0 = ref.get("width", DOCK["seat_width"]); tol = DOCK["seat_width_tol"]; cx0 = ref.get("cx", DOCK["seat_cx"])
+    calibrated = bool(ref)
+    cx0 = ref.get("cx", DOCK["seat_cx"]); tw0 = ref.get("width", DOCK["seat_width"]); tol = DOCK["seat_width_tol"]
+    _dock_set("final", "tag out of view at %.2f m - straight back onto the coil (heading frozen)" % z_from)
+    t0 = time.time(); stalled = False; seated = None; slow_n = 0; corr_n = 0; last_corr = 0.0
+    dist_needed = max(0.10, min(0.70, z_from + 0.05))
+    dist_done = 0.0; last_t = time.time()
     while time.time() - t0 < DOCK["final_max_s"] + 10:
         fr = await _dock_frame("rear"); seat = dock_seat(fr.jpeg) if fr else None
         _dock["sense"] = {"cam": "rear", "seat": seat}
-        # ★ run 11: stopped 2 inches short with the frame "at target" - the screenshot-derived width was
-        #   not the real charge depth. The stand itself is the physical stop: keep creeping back, steering
-        #   on the seat marks, until the wheels stall against it (or, if a live calibration exists, until the
-        #   calibrated width). Depth by geometry only ever pulls us FORWARD if we are past the calibration.
-        calibrated = bool(ref); moving_cmd = False
-        if seat:
-            dx = seat["cx"] - cx0
-            if calibrated and abs(seat["width"] - tw0) <= tol and abs(dx) <= DOCK["seat_cx_tol"]:
-                await _dock_send(0, 0); seated = seat; break
-            if calibrated and seat["width"] > tw0 + tol:
-                await _dock_send(DOCK["seat_creep"], 0.0); moving_cmd = True; _dock_set("final", "seating - too deep (width %.2f), easing forward" % seat["width"])
-            elif abs(dx) > 0.08:
-                # ★ run 16: 21% off on the marks and a 0.15 steer while creeping never fixed it. Stop and pulse.
-                _dock_set("final", "seating - centering on the marks · offset %+.0f%%" % (dx * 100))
-                await _dock_pulse_turn(_dock["sign"]["rear"] * dx, "rear")
-                _dock_log_tick("final", "seat pulse dx=%+.2f" % dx)
-                continue
-            else:
-                # ★ Sep 6 - the last inch. This steering sign was the opposite of the seat pulse three
-                #   lines above it, and of the whole back stage. Between 3% and 8% off the marks it pushed
-                #   the rover further off centre every tick, the pulse yanked it back, and it wobbled off
-                #   the coil right at the end. Same sign as everything else now.
-                ang = 0.0 if abs(dx) <= DOCK["seat_cx_tol"] else DOCK["ang_min_moving"] * _dock["sign"]["rear"] * (1 if dx > 0 else -1)
-                await _dock_send(-DOCK["seat_creep"], ang); moving_cmd = True; _dock_set("final", "seating - creeping to the stand · width %.2f · offset %+.0f%%" % (seat["width"], dx * 100))
-        else:
-            await _dock_send(-DOCK["rev_final"], 0.0); moving_cmd = True; _dock_set("final", "rolling back - waiting for the sheet to fill the frame")
-        _dock_log_tick("final", "seat=%s" % (seat,))
+        spd = abs(float((telemetry_hub.latest or {}).get("speed") or 0.0))
+        now = time.time(); dt = now - last_t; last_t = now
+        # calibrated depth: only a live charge-frame calibration may stop us by geometry
+        if calibrated and seat and not seat.get("bar_only") and abs(seat["width"] - tw0) <= tol and abs(seat["cx"] - cx0) <= DOCK["seat_cx_tol"]:
+            seated = seat; break
+        if calibrated and seat and not seat.get("bar_only") and seat["width"] > tw0 + tol:
+            await _dock_send(DOCK["seat_creep"], 0.0); _dock_set("final", "too deep by the calibrated seat - easing forward"); await asyncio.sleep(1.0 / DOCK["hz"]); continue
+        # drift correction: a stable, non-bar-only read that is clearly off center gets ONE short pulse, at most every 2 s, 3 total
+        if seat and not seat.get("bar_only") and abs(seat["cx"] - cx0) > 0.10 and corr_n < 3 and now - last_corr > 2.0:
+            corr_n += 1; last_corr = now
+            _dock_set("final", "seat marks %+.0f%% off - one correction pulse" % ((seat["cx"] - cx0) * 100))
+            await _dock_pulse_turn(_dock["sign"]["rear"] * (seat["cx"] - cx0), "rear")
+            _dock_log_tick("final", "seat pulse %+.2f" % (seat["cx"] - cx0))
+            continue
+        # the roll: straight back, zero angular
+        await _dock_send(-DOCK["rev_final"], 0.0)
+        dist_done += DOCK["rev_final"] * ODO["mps_per_unit"] * dt
+        _dock_set("final", "straight back · %.0f/%.0f cm · speed %.2f" % (dist_done * 100, dist_needed * 100, spd))
+        _dock_log_tick("final", "seat=%s spd=%.2f" % (seat, spd))
         await asyncio.sleep(1.0 / DOCK["hz"])
-        # ★ run 17: it sat against the stand for 20 s with the marks frozen (width 0.75 ±0.01) and wheels
-        #   slipping on the mat, so the rpm stall never fired and only the timeout ended it. Frozen marks
-        #   under a reverse command = we are against the stand.
-        if seat and moving_cmd and linear_cmd_reverse(_dock.get("_last_cmd")):
-            hist = _dock.setdefault("_seat_hist", []); hist.append((time.time(), seat["width"])); del hist[:-15]
-            if len(hist) >= 12 and hist[-1][0] - hist[0][0] >= 2.5 and max(x[1] for x in hist) - min(x[1] for x in hist) <= 0.03 and abs(seat["cx"] - cx0) <= 0.06:
+        # stall = pinned against the stand: commanded reverse, speed ~0 for 1.5 s (after a short spin-up)
+        if time.time() - t0 > 1.0:
+            slow_n = slow_n + 1 if spd <= 0.05 else 0
+            if slow_n >= int(1.5 * DOCK["hz"]):
                 stalled = True; seated = seat; break
-        if moving_cmd and time.time() - t0 > DOCK["stall_s"] and _dock_rpms_zero():
-            stall_n = getattr(_dock_final, "_stall_n", 0) + 1; _dock_final._stall_n = stall_n
-            if stall_n >= 4:          # ~0.8 s of zero rpm under a real reverse command = against the stand
-                stalled = True; seated = seat; break
-        else:
-            _dock_final._stall_n = 0
+        if dist_done >= dist_needed + 0.15:
+            break   # rolled past the expected distance without a stall - stop and judge, do not keep pushing
+    # explicit stop, and WAIT until the rover is still before anything else happens
+    await _dock_send(0, 0)
+    for _ in range(int(3 * DOCK["hz"])):
+        await asyncio.sleep(1.0 / DOCK["hz"])
+        await _dock_send(0, 0)
+        if abs(float((telemetry_hub.latest or {}).get("speed") or 0.0)) <= 0.02:
+            break
+    if not stalled and seated is None:
+        # ★ a timeout / overrun is NOT a dock. Re-seat (pull forward, back in) or fail - never wait for charge here.
+        if _dock.get("_reseat_runs", 0) < DOCK["reseat_max"]:
+            _dock["_reseat_runs"] = _dock.get("_reseat_runs", 0) + 1
+            _dock_set("reseat", "rolled the distance without meeting the stand - re-seating (%d/%d)" % (_dock["_reseat_runs"], DOCK["reseat_max"]))
+            await _dock_send(DOCK["fwd_near"], 0.0); await asyncio.sleep(DOCK["reseat_m"] / (DOCK["fwd_near"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+            _dock["last_seen"] = None
+            return await _dock_stage_back()
+        _dock["state"] = "failed"; _dock_set("no_contact", "never met the stand after %d re-seats" % DOCK["reseat_max"]); return False
     await _dock_send(0, 0)
     _dock_set("contact", "at the stand (%s) - watching for charge" % (("seated: width %.2f, offset %+.0f%%" % (seated["width"], (seated["cx"] - cx0) * 100)) if seated else ("wheels stalled" if stalled else "ran out of time")))
     # ★ run 21 (photo: rover sideways on top of the stand, "docked - charging 70% → 73%"): the gauge SAGS
@@ -2808,16 +2827,18 @@ async def _dock_loop():
         if not rear_ok:
             _dock["state"] = "failed"; _dock_set("no_rear_cam", "this rover publishes no rear camera"); return
         ap = await _dock_stage_approach()
+        await _dock_send(0, 0)            # ★ explicit stop on every stage exit - a stage's last drive command must never outlive it
         if not ap:
             return
         _dock["last_seen"] = None
         for attempt in range(3):
             if ap != "back":
-                if not await _dock_stage_turn():
+                ok = await _dock_stage_turn(); await _dock_send(0, 0)
+                if not ok:
                     return
                 _dock["last_seen"] = None
             ap = True
-            r = await _dock_stage_back()
+            r = await _dock_stage_back(); await _dock_send(0, 0)
             if r != "turn":
                 return
         _dock["state"] = "failed"; _dock_set("turn_lost", "could not get the rear camera onto the dock after 3 turns")
