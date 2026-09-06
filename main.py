@@ -1114,7 +1114,7 @@ DOCK = {
     # final approach (Cap: "rolling back very slowly until it receives charge - that's when it knows it's arrived")
     "final_z_m": float(os.getenv("DOCK_FINAL_Z_M", "0.60")),        # ★ run 15: with the real 76° lens the tag leaves the rear frame at ~0.46 m - that IS the hand-off
     "rev_final": float(os.getenv("DOCK_REV_FINAL", "0.07")),
-    "final_max_s": float(os.getenv("DOCK_FINAL_MAX_S", "10")),      # blind roll cap
+    "final_max_s": float(os.getenv("DOCK_FINAL_MAX_S", "18")),        # ★ two look-and-adjust checkpoints on the way in      # blind roll cap
     "charge_wait_s": float(os.getenv("DOCK_CHARGE_WAIT_S", "150")), # wait for a battery rise before re-seating
     "nudge_s": float(os.getenv("DOCK_NUDGE_S", "0.8")),             # extra push if no charge after the wait
     "yaw_min_px": float(os.getenv("DOCK_YAW_MIN_PX", "60")),        # pose yaw is only trusted when the tag is this big
@@ -1155,7 +1155,7 @@ DOCK = {
     #   (values below are as measured by dock_seat() at feed resolution; charged = width 0.633 / cx +0.035,
     #    the two no-charge seats = 0.66-0.67. The margin is thin, so the seat is also CALIBRATED live: Connect
     #    calls /dock calibrate_seat whenever it sees the battery charging, and that measurement wins.)
-    "seat_cx": float(os.getenv("DOCK_SEAT_CX", "0.06")),
+    "seat_cx": float(os.getenv("DOCK_SEAT_CX", "-0.10")),           # ★ from the charging dock of Sep 6 13:41 (cx -0.105) - the rear camera sits off the coil axis
     "seat_cx_tol": float(os.getenv("DOCK_SEAT_CX_TOL", "0.03")),
     "seat_width": float(os.getenv("DOCK_SEAT_WIDTH", "1.0")),        # as dock_seat() measures Cap's docked reference frame (bar-only read, lamp on)
     "seat_width_tol": float(os.getenv("DOCK_SEAT_WIDTH_TOL", "0.06")),
@@ -3004,6 +3004,45 @@ def linear_cmd_reverse(cmd):
         return False
 
 
+async def _dock_final_checkpoint(label: str, cx0: float):
+    """★ Cap (Sep 6 evening): "it's missing the final connection by a few inches - one foot out it can stop
+    and check for one last adjustment, and a second check at six inches." Stop, settle, look with the rear
+    camera, and make ONE small correction if the picture says we are off center. Centering cues in order of
+    trust: the seat marks against a live calibration, the mat's centerline/rails, the sheet's position.
+    Then straight again. Never more than one correction per checkpoint."""
+    await _dock_send(0, 0)
+    for _ in range(int(1.2 * DOCK["hz"])):
+        await asyncio.sleep(1.0 / DOCK["hz"]); await _dock_send(0, 0)
+        if abs(float((telemetry_hub.latest or {}).get("speed") or 0.0)) <= 0.02:
+            break
+    see = await _dock_settled_look("rear"); fr = await _dock_frame("rear")
+    seat = dock_seat(fr.jpeg) if fr else None
+    err = None; src = None
+    ref = _dock.get("seat_ref") or {}
+    # ★ Cap: "on the bottom, the last rows will show at the final steps" - in the last foot the rear camera
+    #   sees the flyer's bottom edge: the center BAR and the two stripes. The tag and the X are above the
+    #   frame here and must never be required. The bar is the cue; bar-only reads are fine for centering.
+    if seat and seat.get("cx") is not None:
+        err = seat["cx"] - (ref.get("cx", cx0) if ref else cx0); src = "bottom bar" + ("" if ref else " (uncalibrated center)")
+    elif see and see.get("lane_err") is not None:
+        err = float(see["lane_err"]); src = "mat centerline"
+    elif see and see.get("sheet"):
+        err = float(see["sheet"]["x_err"]); src = "sheet"
+    elif see and see.get("tag"):
+        err = float(see["tag"]["x_err"]); src = "tag"
+    _dock["sense"] = {"cam": "rear", "seat": seat, "checkpoint": label, "err": err, "src": src}
+    if err is None:
+        _dock_set("final", "%s checkpoint: nothing to center on - continuing straight" % label)
+        _docklog_event("checkpoint", "%s: no centering cue in the rear frame" % label); return
+    if abs(err) <= 0.04:
+        _dock_set("final", "%s checkpoint: centered (%s %+.0f%%) - continuing straight" % (label, src, err * 100))
+        _docklog_event("checkpoint", "%s: centered by %s (%+.2f)" % (label, src, err)); return
+    _dock_set("final", "%s checkpoint: %s %+.0f%% off - one small correction" % (label, src, err * 100))
+    _docklog_event("checkpoint", "%s: %s %+.2f → one pulse" % (label, src, err))
+    await _dock_pulse_turn(_dock["sign"]["rear"] * err, "rear")
+    await _dock_send(0, 0); await asyncio.sleep(0.4)
+
+
 async def _dock_final(z_from: float):
     """★ Sep 6 morning (log 20260906-125508, analysed by Cap's browser session): the rover reached the
     stand PERFECTLY lined up (lat -0.01, yaw 0°) and then lost it in the last 40 cm, because:
@@ -3024,7 +3063,14 @@ async def _dock_final(z_from: float):
     t0 = time.time(); stalled = False; seated = None; slow_n = 0; corr_n = 0; last_corr = 0.0
     dist_needed = max(0.10, min(0.70, z_from + 0.05))
     dist_done = 0.0; last_t = time.time()
+    checkpoints = [(0.30, "1 ft"), (0.15, "6 in")]     # distance-to-go at which we stop and look
     while time.time() - t0 < DOCK["final_max_s"] + 10:
+        to_go = dist_needed - dist_done
+        if checkpoints and to_go <= checkpoints[0][0]:
+            _, lbl = checkpoints.pop(0)
+            await _dock_final_checkpoint(lbl, cx0)
+            last_t = time.time(); slow_n = 0
+            continue
         fr = await _dock_frame("rear"); seat = dock_seat(fr.jpeg) if fr else None
         _dock["sense"] = {"cam": "rear", "seat": seat}
         spd = abs(float((telemetry_hub.latest or {}).get("speed") or 0.0))
@@ -3035,7 +3081,7 @@ async def _dock_final(z_from: float):
         if calibrated and seat and not seat.get("bar_only") and seat["width"] > tw0 + tol:
             await _dock_send(DOCK["seat_creep"], 0.0); _dock_set("final", "too deep by the calibrated seat - easing forward"); await asyncio.sleep(1.0 / DOCK["hz"]); continue
         # drift correction: a stable, non-bar-only read that is clearly off center gets ONE short pulse, at most every 2 s, 3 total
-        if seat and not seat.get("bar_only") and abs(seat["cx"] - cx0) > 0.10 and corr_n < 3 and now - last_corr > 2.0:
+        if seat and seat.get("cx") is not None and abs(seat["cx"] - cx0) > 0.10 and corr_n < 3 and now - last_corr > 2.0:
             corr_n += 1; last_corr = now
             _dock_set("final", "seat marks %+.0f%% off - one correction pulse" % ((seat["cx"] - cx0) * 100))
             await _dock_pulse_turn(_dock["sign"]["rear"] * (seat["cx"] - cx0), "rear")
