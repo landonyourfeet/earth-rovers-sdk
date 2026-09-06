@@ -2514,9 +2514,21 @@ async def _dock_stage_approach():
                         await _dock_send(0, 0); await _dock_retreat(learner, awm)
                         await _dock_axis_crab(learner, yaw_med, z0=awm, lat_hint=(rw.get("lat") if rw else None))
                         _dock["_yaw_hist"] = []; continue
-                    ang = 0.0 if abs(x_err) < DOCK["center_tol"] else max(-0.25, min(0.25, learner.sign() * x_err * DOCK["turn_gain"]))
+                    # ★ run 16:45: it drove "straight" with the tag centered while the WALL angle went -2° → -27° over
+                    #   2.3 m - the rover drifts, and a 5% tag deadband hides it until the turn is hopeless. On final the
+                    #   heading is held on the wall reading (live, every frame) plus a tight 2% tag deadband.
+                    wl = see.get("wall") if see else None
+                    phi_live = wl.get("phi") if (wl and wl.get("phi") is not None and (wl.get("q") or 0) >= DOCK["wall_q_min"]) else None
+                    ang = 0.0 if abs(x_err) < 0.02 else learner.sign() * x_err * DOCK["turn_gain"]
+                    if phi_live is not None and abs(phi_live) > 3:
+                        ang += (-phi_live / 40.0) * _dock.get("_wall_steer_sign", 1)
+                        ph = _dock.setdefault("_phi_hist", []); ph.append(abs(phi_live)); del ph[:-7]
+                        if len(ph) >= 7 and all(ph[i] > ph[i - 1] + 0.3 for i in range(1, 7)):
+                            _dock["_wall_steer_sign"] = -_dock.get("_wall_steer_sign", 1); _dock["_phi_hist"] = []
+                            _docklog_event("sign_flip", "wall heading-hold sign → %+d (the angle kept growing while steering on it)" % _dock["_wall_steer_sign"])
+                    ang = max(-0.25, min(0.25, ang))
                     lin = DOCK["fwd_near"] if z < 1.0 else DOCK["fwd"]
-                    _dock_set("final_approach", "on final · %.2f m · %+d%% · yaw %s" % (z, int(x_err * 100), ("%+d°" % yaw_med) if yaw_ok else "—"))
+                    _dock_set("final_approach", "on final · %.2f m · %+d%% · wall %s" % (z, int(x_err * 100), ("%+.0f°" % phi_live) if phi_live is not None else "—"))
                     learner.observe(x_err, ang != 0.0)
                     await _dock_send(lin, ang)
                     _dock_log_tick("approach")
