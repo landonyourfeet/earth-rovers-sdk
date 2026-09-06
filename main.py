@@ -2543,7 +2543,7 @@ async def _dock_final(z_from: float):
         _dock["sense"] = {"cam": "rear", "led": led}
         _dock_log_tick("contact", "bat %s->%s led=%s" % (b0, b, led))
         if led and led["lit"]:
-            _dock["state"] = "docked"; _dock_set("docked", "stand LED is green - charging (battery %s%%)" % b); return True
+            _dock["state"] = "docked"; _dock_set("docked", "stand LED is green - charging (battery %s%%)" % b); await _dock_self_calibrate("LED green"); return True
         # a one-sample flicker (78/79/80 during the seat) is not a rise: need it twice
         if b0 is not None and b is not None and b >= b0 + 1:
             rise_n += 1
@@ -2554,7 +2554,7 @@ async def _dock_final(z_from: float):
         if time.time() - last_raw >= 10:
             last_raw = time.time(); _docklog_event("raw_telemetry", "+%ds after contact" % int(time.time() - tw), {"raw": telemetry_hub.latest})
         if b0 is not None and b is not None and b >= b0 + 1 and rise_n >= (2 if seat_ok else 6):
-            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%%s" % (b0, b, "" if seat_ok else " (seat unconfirmed - long rise)")); _odo_set_home("self-dock charging"); return True
+            _dock["state"] = "docked"; _dock_set("docked", "charging - battery %d%% -> %d%%%s" % (b0, b, "" if seat_ok else " (seat unconfirmed - long rise)")); _odo_set_home("self-dock charging"); await _dock_self_calibrate("battery rise"); return True
         if b0 is not None and b is not None and b0 >= 99:
             _dock["state"] = "docked"; _dock_set("docked", "on the pads at %d%% (battery full - can't see charge)" % b); return True
         if time.time() - tw > DOCK["charge_wait_s"]:
@@ -2903,6 +2903,21 @@ def _dock_progress():
     return 0
 
 
+async def _dock_self_calibrate(reason: str):
+    """★ Sep 6 (run 20260906-134126 docked and charged, and seat_ref was STILL null): the calibration waited
+    on Connect to notice charging, which takes minutes. A confirmed dock is the calibration sample - take
+    it right now, from the frame the rear camera is looking at, and print the env values so a redeploy
+    can keep them."""
+    try:
+        fr = await _dock_frame("rear"); seat = dock_seat(fr.jpeg) if fr else None
+        if seat:
+            _dock["seat_ref"] = dict(seat, at=time.time(), reason=reason)
+            logger.info("dock: SEAT SELF-CALIBRATED on a confirmed dock (%s): %s  → DOCK_SEAT_WIDTH=%s DOCK_SEAT_CX=%s", reason, seat, seat["width"], seat["cx"])
+            _docklog_event("seat_cal", "seat reference self-calibrated on a confirmed dock (%s): %s" % (reason, seat))
+    except Exception as e:
+        logger.warning("dock: self-calibration failed: %s", e)
+
+
 def _dock_status():
     return {"return": _return_status(), "odo": _odo_pos(), "seat_ref": _dock.get("seat_ref"), "active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
             "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
@@ -2934,6 +2949,12 @@ async def dock_post(request: Request):
     if action == "stop":
         await _dock_cancel("stopped by operator")
         return _dock_status()
+    if action == "set_seat":
+        seat = (body or {}).get("seat") or {}
+        if seat.get("width") and seat.get("cx") is not None:
+            _dock["seat_ref"] = {"cx": float(seat["cx"]), "width": float(seat["width"]), "at": time.time(), "reason": "restored from Connect"}
+            return {"ok": True, "seat": _dock["seat_ref"]}
+        raise HTTPException(status_code=400, detail="seat needs cx and width")
     if action == "calibrate_seat":
         # the rover is on the dock and charging RIGHT NOW: this frame geometry is the truth
         fr = await feed_broadcasters["rear"].get_frame(max_age=0.5, timeout=3.0, fps=5)
