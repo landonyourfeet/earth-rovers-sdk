@@ -2745,12 +2745,39 @@ async def _dock_stage_approach():
                     await _dock_axis_crab(learner, (-1 if xm_now > 0 else 1) * max(12, abs(xm_now) * 12.0), z0=awm, lat_hint=None)
                     _dock["_yaw_hist"] = []; _dock["_xmark_hist"] = []
                     continue
-                if _dock.get("_sight_seen") and xm_now is None:
-                    pass   # frozen: the sight decided this out at range; the tag's yaw does not get to re-decide here
-                elif yaw_ok and abs(yaw_med) > DOCK["yaw_ok_deg"] and al is None:
-                    await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "could not get straight on (yaw %+d° after %d passes) - not turning crooked" % (yaw_med, _dock.get("_crab_n", 0))); return False
+                # ★ Cap (Sep 6, run 23:30): it turned at 1.03 m sitting "+10% off center, yaw not measurable" and
+                #   the back-in started 21 cm off the axis - the 3-point correction and both checkpoints did their
+                #   best and it still missed. "Make sure it's perfectly lined up prior to the turn; if not, back off
+                #   and try again." The turn gate is now a real gate: settled, centered within 3%, and any yaw that
+                #   is measurable within 8°, from several looks. Fail it → back out to the fix and re-fly the line-up,
+                #   three times, then an honest failure. Nobody turns crooked.
                 await _dock_send(0, 0)
-                _dock_set("staged", "%.2f m from the stand, %+d%% off center, dock yaw %s — turning" % (z, int(x_err * 100), ("%+d°" % yaw_med) if yaw_ok else "not measurable (flying the picture)"))
+                looks = []
+                for _ in range(5):
+                    sv = await _dock_settled_look("front"); tv = sv and sv.get("tag")
+                    if tv:
+                        yv, _src, _n = _dock_yaw(sv)
+                        looks.append((tv["x_err"], yv, _n, tv.get("side_px") or 0))
+                if len(looks) >= 3:
+                    xe_m = sorted(l[0] for l in looks)[len(looks) // 2]
+                    ys = [l[1] for l in looks if l[1] is not None]
+                    y_m = sorted(ys)[len(ys) // 2] if ys else None
+                    noise = looks[0][2]
+                    yaw_measurable = y_m is not None and len(ys) >= 3 and abs(y_m) > noise * 0.45   # a consistent reading above half the noise band is real
+                    lined = abs(xe_m) <= 0.03 and (not yaw_measurable or abs(y_m) <= 8)
+                    if lined:
+                        _dock_set("staged", "%.2f m from the stand · centered %+d%% · yaw %s — lined up, turning" % (z, int(xe_m * 100), ("%+d°" % y_m) if y_m is not None else "—"))
+                        return True
+                    _dock["_stage_gate_fails"] = _dock.get("_stage_gate_fails", 0) + 1
+                    if _dock["_stage_gate_fails"] >= 3:
+                        _dock["state"] = "failed"; _dock_set("not_lined_up", "not lined up at the turn point three times (%+d%%, yaw %s) - not turning crooked" % (int(xe_m * 100), ("%+d°" % y_m) if y_m is not None else "—")); return False
+                    _dock_set("retreat", "not lined up at the turn point (%+d%%, yaw %s) - backing out to the fix to re-fly (%d/3)" % (int(xe_m * 100), ("%+d°" % y_m) if y_m is not None else "—", _dock["_stage_gate_fails"]))
+                    _docklog_event("turn_gate", "refused the turn: centered %+.2f, yaw %s, noise %.0f° - back to the fix" % (xe_m, y_m, noise))
+                    await _dock_retreat(learner, (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"])
+                    _dock["_stage1_done"] = False; _dock["_stage1_pass"] = False; _dock["_sight_seen"] = False
+                    _dock["_yaw_hist"] = []; _dock["_xmark_hist"] = []; _dock["_measured_once"] = False
+                    continue
+                _dock_set("staged", "%.2f m from the stand, %+d%% off center — turning" % (z, int(x_err * 100)))
                 return True
         if tag and tag.get("stage_dist_m") is not None:
             sd = tag["stage_dist_m"]; sb = tag["stage_bearing_deg"]; yaw = tag.get("yaw_deg", 0.0)
@@ -3425,7 +3452,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
