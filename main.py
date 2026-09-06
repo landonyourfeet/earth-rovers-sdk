@@ -1781,25 +1781,35 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
     smaller; bigger → it was the other side. One dogleg moves the whole offset, not 35 cm of it."""
     z = z0 or 2.0
     d = max(0.15, min(1.5, abs(z * math.sin(math.radians(min(abs(y0), 60))))))
+    # ★ Cap (9:08 PM): "it should have made the first move RIGHT but it chose left." The dock was on the
+    #   right of the picture. Rule: the first turn is TOWARD the side the dock is on. Only when the tag is
+    #   dead center is the yaw / runway sign used - and then a short PROBE leg proves it before the long leg.
+    see0 = await _dock_settled_look("front"); tag0 = see0 and see0.get("tag")
+    x0 = tag0["x_err"] if tag0 else 0.0
     side = _dock.get("_crab_side")
     if side is None:
-        # runway lat: centerline to the right of frame center → we are LEFT of the axis → move right
-        side = (1 if lat_hint > 0 else -1) if (lat_hint is not None and abs(lat_hint) > 0.03) else (1 if y0 > 0 else -1)
+        if abs(x0) > 0.08:
+            side = 1 if x0 > 0 else -1
+        else:
+            side = (1 if lat_hint > 0 else -1) if (lat_hint is not None and abs(lat_hint) > 0.03) else (1 if y0 > 0 else -1)
     hfov = math.radians(DOCK["hfov_deg"])
-    # (1) turn out until the tag sits ~40% off center (keep it in the window)
-    x_out = None
+    # (1) turn out: measure the ROTATION by how far the tag moved in the frame, not where it ended up
+    x_out = x0; turned = 0.0
     for _ in range(9):
         see = await _dock_pulse_turn(side, "front"); tag = see and see.get("tag")
         _dock_log_tick("crab", "turn-out x_err=%s" % (tag and tag["x_err"]))
         if not tag:
-            # overshot the window: come back one pulse and use the last good x
             await _dock_pulse_turn(-side, "front"); break
         x_out = tag["x_err"]
-        if abs(x_out) >= 0.40:
+        if abs(x_out - x0) >= 0.40 or abs(x_out) >= 0.42:
             break
-    phi = math.atan(abs(x_out or 0.40) * 2 * math.tan(hfov / 2))      # angle turned, from where the tag went in the frame
+    phi = abs(math.atan((x_out) * 2 * math.tan(hfov / 2)) - math.atan((x0) * 2 * math.tan(hfov / 2)))
     phi = max(math.radians(15), min(math.radians(70), phi))
     leg = max(0.3, min(2.0, d / math.sin(phi)))
+    if _dock.get("_crab_side") is None and not _dock.get("_crab_probed"):
+        # first pass: a short probe leg proves the side before the long leg is committed
+        _dock["_crab_probed"] = True
+        leg = min(leg, 0.4)
     _dock_set("axis", "dogleg: %.0f cm beside the axis · turned %d° · leg %.2f m" % (d * 100, math.degrees(phi), leg))
     _docklog_event("crab", "dogleg side %+d: d=%.2f phi=%d° leg=%.2f" % (side, d, math.degrees(phi), leg))
     # (2) the leg, straight
