@@ -3323,7 +3323,9 @@ async def _dock_target_lock():
         return _lock_cache["v"]
     out = {"tag": False}
     try:
-        if browser_service.is_ready() if hasattr(browser_service, "is_ready") else True:
+        ready = getattr(browser_service, "is_ready", True)
+        ready = ready() if callable(ready) else bool(ready)
+        if ready:
             fr = await feed_broadcasters["front"].get_frame(max_age=1.5, timeout=1.5, fps=2)
             if fr:
                 see = dock_see(fr.jpeg, "front")
