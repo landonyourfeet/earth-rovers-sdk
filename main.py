@@ -1677,7 +1677,11 @@ def dock_xmark(img, tag, w, h):
         if not cands:
             return {"off": None, "why": "no X-like dark shape above the tag", "thr": thr, "band": [x0, y0, x1, y1], "n_dark": len(cs)}
         best = max(cands, key=lambda c: c["area"])
-        return {"off": round(float((best["cx"] - cx) / side), 3), "thr": thr, "cands": len(cands), "w": int(best["w"]), "fill": best["fill"]}
+        raw = float((best["cx"] - cx) / side)
+        # ★ Sep 7: the build bias is subtracted HERE, once, where the value is produced - the same way the wall's
+        #   slope bias is. Before this it was subtracted by some consumers, not others, and never by the HUD, so a
+        #   rover centred by hand read -0.17 on the badge and was "corrected" sideways by 22 cm every morning.
+        return {"off": round(raw - _dock.get("xmark_bias", DOCK["xmark_bias"]), 3), "raw": round(raw, 3), "thr": thr, "cands": len(cands), "w": int(best["w"]), "fill": best["fill"]}
     except Exception as e:
         return {"off": None, "why": "error: " + str(e)[:80]}
 
@@ -2150,7 +2154,7 @@ async def _dock_stage_one(learner):
                 sv = await _dock_settled_look("front"); tv = sv and sv.get("tag"); xd = sv and sv.get("xmark")
                 xo = xd.get("off") if isinstance(xd, dict) else None
                 if tv and tv.get("z_m") and xo is not None:
-                    xr.append((xo - _dock.get("xmark_bias", DOCK["xmark_bias"]), tv["x_err"], tv["z_m"], tv["side_px"]))
+                    xr.append((xo, tv["x_err"], tv["z_m"], tv["side_px"]))
             if len(xr) >= 3:
                 xo = sorted(r[0] for r in xr)[len(xr) // 2]; xe = sorted(r[1] for r in xr)[len(xr) // 2]
                 zz = sorted(r[2] for r in xr)[len(xr) // 2]
@@ -2178,7 +2182,7 @@ async def _dock_stage_one(learner):
             continue
         phis = sorted(r[0] for r in reads); phi = phis[len(phis) // 2]
         beta = sorted(r[1] for r in reads)[len(reads) // 2]; D = sorted(r[2] for r in reads)[len(reads) // 2]
-        xms = [r[3] for r in reads if r[3] is not None]; xm = (sorted(xms)[len(xms) // 2] - _dock.get("xmark_bias", DOCK["xmark_bias"])) if xms else None
+        xms = [r[3] for r in reads if r[3] is not None]; xm = sorted(xms)[len(xms) // 2] if xms else None
         if max(phis) - min(phis) > 8:
             _docklog_event("stage1", "wall readings disagree (%s) - re-acquiring (%d/3)" % ([round(v) for v in phis], attempt + 1))
             await _dock_retreat(learner, F + 0.3)
@@ -2294,7 +2298,7 @@ async def _dock_stage_one(learner):
         for _ in range(3):
             sv = await _dock_settled_look("front"); xd = sv and sv.get("xmark"); xo = xd.get("off") if isinstance(xd, dict) else None
             if xo is not None:
-                xm2s.append(xo - _dock.get("xmark_bias", DOCK["xmark_bias"]))
+                xm2s.append(xo)
         if xm2s:
             xm2 = sorted(xm2s)[len(xm2s) // 2]
             lat2 = 0.0 if abs(xm2) <= DOCK["xmark_ok"] else (1 if xm2 > 0 else -1) * max(0.15, abs(xm2) * DOCK["tag_m"] * (z2 + DOCK["xmark_depth_m"]) / DOCK["xmark_depth_m"])
@@ -2429,8 +2433,6 @@ async def _dock_axis_crab(learner, y0, z0=None, lat_hint=None):
         al0 = see0.get("align") if see0 else None
         xm0d = see0.get("xmark") if see0 else None
         xm0 = xm0d.get("off") if isinstance(xm0d, dict) else xm0d
-        if xm0 is not None:
-            xm0 = xm0 - _dock.get("xmark_bias", DOCK["xmark_bias"])
         if _dock.get("_crab_side_hint") is not None:
             side = _dock["_crab_side_hint"]; _dock["_crab_side_hint"] = None
             _docklog_event("crab", "side from the wall X (median) → move %s" % ("RIGHT" if side > 0 else "LEFT"))
@@ -2718,8 +2720,6 @@ async def _dock_stage_approach():
             #   side of the tag is a side-of-axis measurement from any distance. It outranks the tag's yaw.
             xmd = see.get("xmark") if see else None
             xm = xmd.get("off") if isinstance(xmd, dict) else xmd
-            if xm is not None:
-                xm = xm - _dock.get("xmark_bias", DOCK["xmark_bias"])
             xh = _dock.setdefault("_xmark_hist", [])
             if xm is not None:
                 xh.append(xm); del xh[:-5]
@@ -2850,8 +2850,6 @@ async def _dock_stage_approach():
                     continue
                 xm_nowd = see.get("xmark") if see else None
                 xm_now = xm_nowd.get("off") if isinstance(xm_nowd, dict) else xm_nowd
-                if xm_now is not None:
-                    xm_now = xm_now - _dock.get("xmark_bias", DOCK["xmark_bias"])
                 if xm_now is not None and abs(xm_now) > DOCK["xmark_ok"] * 2 and _dock.get("_crab_n", 0) < DOCK["axis_align_max"] + 2:
                     _dock["_crab_n"] = _dock.get("_crab_n", 0) + 1
                     _dock_set("axis", "not straight on - wall X %+.2f tag-widths off the tag - backing out to square up" % xm_now)
@@ -3786,8 +3784,8 @@ async def dock_post(request: Request):
         if wl and isinstance(wl.get("high"), dict) and wl["high"].get("slope") is not None:
             _dock["wall_slope_bias_high"] = float(wl["high"]["slope"]); outz["wall_slope_bias_high"] = round(float(wl["high"]["slope"]), 4)
         xmd = see.get("xmark") if see else None
-        if isinstance(xmd, dict) and xmd.get("off") is not None:
-            _dock["xmark_bias"] = float(xmd["off"]); outz["xmark_bias"] = xmd["off"]
+        if isinstance(xmd, dict) and xmd.get("raw") is not None:
+            _dock["xmark_bias"] = float(xmd["raw"]); outz["xmark_bias"] = xmd["raw"]
         logger.info("dock: ZEROED %s → set DOCK_WALL_SLOPE_BIAS=%s DOCK_WALL_SLOPE_BIAS_HIGH=%s DOCK_HORIZON_Y=%s DOCK_XMARK_BIAS=%s", outz, outz.get("wall_slope_bias"), outz.get("wall_slope_bias_high"), outz.get("horizon_y"), outz.get("xmark_bias"))
         _docklog_event("zero", "zeroed: %s" % outz)
         return outz
@@ -3817,7 +3815,7 @@ async def dock_post(request: Request):
     if action == "zero_xmark":
         # the rover is parked dead on the dock axis, looking at the dock: whatever the sight reads now is build bias
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None
-        xmd = see.get("xmark") if see else None; off = xmd.get("off") if isinstance(xmd, dict) else None
+        xmd = see.get("xmark") if see else None; off = xmd.get("raw") if isinstance(xmd, dict) else None
         if off is None:
             return {"ok": False, "error": "the wall X is not readable from here", "detail": xmd}
         _dock["xmark_bias"] = float(off)
