@@ -1220,7 +1220,12 @@ DOCK = {
     #   day, days from a human. Slow and right beats fast and dead. Time is cheap; battery is life. Ten minutes of
     #   careful docking is fine; a rushed miss that leaves it stranded is not.
     "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "600")),
-    "reserve_pct": float(os.getenv("DOCK_RESERVE_PCT", "15")),         # below this, no go-arounds: one straight try, then stop and call home "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
+    "reserve_pct": float(os.getenv("DOCK_RESERVE_PCT", "15")),         # below this, no go-arounds: one straight try, then stop and call home
+    "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
+    # ★ Sep 7: found by the same audit that caught stall_s - the mat-rails reader (dock_sense) has referenced a
+    #   key that never existed, inside a try/except that swallowed the KeyError, so `rails` / `lane_err` have
+    #   been None on every frame since the mat was printed. Defined now; the checkpoints can use the centreline.
+    "dot_done_ratio": float(os.getenv("DOCK_DOT_DONE_RATIO", "0.30")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
     # ★ Cap: "are you sure we are not misreading the quality of the camera feed?" The viewer feed is
     #   scaled to 640 px for bandwidth; the docker no longer uses that for the front camera - it takes
