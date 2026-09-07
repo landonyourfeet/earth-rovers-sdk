@@ -1216,7 +1216,11 @@ DOCK = {
     #   has been covered (or DOCK_SEARCH_S as the ceiling), checking BOTH cameras each stop.
     "search_turn": float(os.getenv("DOCK_SEARCH_TURN", "0.65")), "search_s": float(os.getenv("DOCK_SEARCH_S", "90")),
     "search_pulse_s": float(os.getenv("DOCK_SEARCH_PULSE_S", "0.8")),
-    "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "240")), "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
+    # ★ Cap (Sep 6): "think of self-docking as being in space" - the rover will dock alone, at a listing, on a closed
+    #   day, days from a human. Slow and right beats fast and dead. Time is cheap; battery is life. Ten minutes of
+    #   careful docking is fine; a rushed miss that leaves it stranded is not.
+    "timeout_s": float(os.getenv("DOCK_TIMEOUT_S", "600")),
+    "reserve_pct": float(os.getenv("DOCK_RESERVE_PCT", "15")),         # below this, no go-arounds: one straight try, then stop and call home "stall_s": float(os.getenv("DOCK_STALL_S", "2.0")),
     "hz": float(os.getenv("DOCK_HZ", "5")),
     # ★ Cap: "are you sure we are not misreading the quality of the camera feed?" The viewer feed is
     #   scaled to 640 px for bandwidth; the docker no longer uses that for the front camera - it takes
@@ -2070,7 +2074,11 @@ async def _dock_stage_one(learner):
     fx = (1024 / 2.0) / math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)   # per 1024-px frame; x_err is normalized
     def bearing(x_err): return math.degrees(math.atan(x_err * 2 * math.tan(math.radians(DOCK["hfov_deg"]) / 2.0)))
     F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
-    for attempt in range(3):
+    b_now = _dock_battery()
+    tries = 1 if (b_now is not None and b_now < DOCK["reserve_pct"]) else 3
+    if tries == 1:
+        _docklog_event("reserve", "battery %s%% is under the %d%% reserve - one careful attempt, no go-arounds" % (b_now, int(DOCK["reserve_pct"])))
+    for attempt in range(tries):
         # 1. acquire: rotate in place only, until the tag is near the center of the frame
         _dock_set("stage1", "acquire - centering the tag by rotation only")
         # ★ (browser-session review, Sep 6): a 5% band is narrower than one ~6° pulse, and one dropped detection
@@ -2125,12 +2133,12 @@ async def _dock_stage_one(learner):
                     _docklog_event("stage1", "no wall line; X sight %+.3f → %.2f m %s of the axis - dogleg from the sight (%d/3)" % (xo, d_est, "right" if side < 0 else "left", attempt + 1))
                     _dock["_crab_side_hint"] = side
                     await _dock_axis_crab(learner, side * -1 * math.degrees(math.asin(min(0.95, d_est / max(zz, 0.6)))), z0=max(zz, F), lat_hint=None)
-                    if attempt >= 2:
+                    if attempt >= tries - 1:
                         await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "three passes on the X sight and still off the axis - not going in"); return None
                     continue
             _docklog_event("stage1", "wall not measurable here (%d good reads) and no usable X sight - backing to the fix and re-acquiring (%d/3)" % (len(reads), attempt + 1))
             await _dock_retreat(learner, F + 0.3)
-            if attempt >= 2:
+            if attempt >= tries - 1:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "could not measure the wall at the fix - not going in"); return None
             continue
         phis = sorted(r[0] for r in reads); phi = phis[len(phis) // 2]
@@ -2139,7 +2147,7 @@ async def _dock_stage_one(learner):
         if max(phis) - min(phis) > 8:
             _docklog_event("stage1", "wall readings disagree (%s) - re-acquiring (%d/3)" % ([round(v) for v in phis], attempt + 1))
             await _dock_retreat(learner, F + 0.3)
-            if attempt >= 2:
+            if attempt >= tries - 1:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "wall readings never settled at the fix - not going in"); return None
             continue
         # rover position: tag direction in world frame is heading + bearing
@@ -2164,7 +2172,7 @@ async def _dock_stage_one(learner):
         if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15 and False:
             _docklog_event("stage1", "two sensors disagree on the side - not planning on either (%d/3)" % (attempt + 1))
             await _dock_retreat(learner, F + 0.3)
-            if attempt >= 2:
+            if attempt >= tries - 1:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "sensors disagree at the fix - not going in"); return None
             continue
         # already at the fix?
@@ -2191,7 +2199,7 @@ async def _dock_stage_one(learner):
             _dock_set("stage1", "at the fix (%.0f cm off, φ %+.0f°) - close enough to fly straight" % (lat * 100, phi)); return True
         if dist > 2.5 or abs(lat) > 2.2:
             _docklog_event("stage1", "plan rejected: %.2f m leg / %.2f m beside the axis is not credible from %.2f m range - re-measuring (%d/3)" % (dist, lat, D, attempt + 1))
-            if attempt >= 2:
+            if attempt >= tries - 1:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "measurements never produced a credible plan - not going in"); return None
             continue
         _dock_set("stage1", "plan: turn %+.0f°, drive %.2f m, square up (fix %.1f m out)" % (turn1, dist, F))
@@ -2233,7 +2241,7 @@ async def _dock_stage_one(learner):
         if len(ok_reads) < 3:
             _docklog_event("stage1", "could not verify at the fix (wall unreadable) - go-around %d/3" % (attempt + 1))
             await _dock_retreat(learner, F + 0.3)
-            if attempt >= 2:
+            if attempt >= tries - 1:
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_lineup", "could not verify the line-up at the fix - not going in"); return None
             continue
         phi2 = sorted(r[0] for r in ok_reads)[len(ok_reads) // 2]; lat2 = sorted(r[1] for r in ok_reads)[len(ok_reads) // 2]
@@ -2251,8 +2259,8 @@ async def _dock_stage_one(learner):
         if passed:
             _dock_set("stage1", "lined up at the fix - handing off to final"); return True
         _dock_set("stage1", "not lined up at the fix (%.0f cm, φ %+.0f°) - go-around %d/3" % (lat2 * 100, phi2, attempt + 1))
-        if attempt >= 2:
-            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "three go-arounds and still not lined up at the fix - not continuing crooked"); return None
+        if attempt >= tries - 1:
+            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("not_lined_up", "go-arounds exhausted and still not lined up at the fix - not continuing crooked"); return None
         await _dock_retreat(learner, F + 0.3)
     return None
 
