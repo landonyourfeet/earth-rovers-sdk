@@ -2318,6 +2318,7 @@ async def _dock_retreat(learner, to_m: float):
     F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
     if not to_m or to_m < 1.0:
         to_m = F
+    _dock["_retreat_seg"] = 0.0
     _dock_set("retreat", "too close to fix the angle - backing out to %.1f m" % to_m)
     t0 = time.time(); last_tag = time.time(); backed = 0.0
     while time.time() - t0 < 12:
@@ -2331,16 +2332,21 @@ async def _dock_retreat(learner, to_m: float):
         if backed >= 1.0:
             _docklog_event("retreat", "backed 1.0 m without reaching %.1f m - stopping" % to_m); break
         backed += DOCK["fwd_near"] * ODO["mps_per_unit"] / DOCK["hz"]
-        ang = 0.0
-        if tag and abs(tag["x_err"]) >= 0.05:
-            # ★ Sep 6, straight off the live feed: backing out under this "opposite sense" sign took
-            #   x_err from +0.02 to +0.09 to +0.13 in three ticks - the error grew under correction every
-            #   time. Centring a marker is a BEARING correction, and rotating the body moves the tag across
-            #   the frame the same way whether we are driving forward or backward, so the sign does NOT
-            #   flip. This line was steering the rover off the dock axis during every retreat, and the axis
-            #   code then doglegged to "fix" an offset the retreat had just created.
-            ang = max(-0.2, min(0.2, learner.sign() * tag["x_err"] * DOCK["turn_gain"]))
-        await _dock_send(-DOCK["fwd_near"], ang)
+        # ★ Sep 7 (run 14:00): steering while reversing swung the heading 16° → 87° in ten seconds and the tag left the
+        #   frame - the retreat went blind and the rover spent 35 s re-acquiring a dock it had cleanly. Same doctrine as
+        #   the back-in: NO steering while moving. Back straight ~30 cm, stop, re-centre the tag with a pulse in place
+        #   if it drifted, back straight again. The tag stays in the frame the whole way out.
+        seg = _dock.get("_retreat_seg", 0.0)
+        if seg >= 0.30:
+            await _dock_send(0, 0); await asyncio.sleep(0.5)
+            sv = await _dock_settled_look("front"); tv = sv and sv.get("tag")
+            if tv and abs(tv["x_err"]) >= 0.05:
+                await _dock_pulse_turn(learner.sign() * tv["x_err"], "front")
+                _dock_log_tick("retreat", "stop-recentre %+.2f" % tv["x_err"])
+            _dock["_retreat_seg"] = 0.0
+            continue
+        _dock["_retreat_seg"] = seg + DOCK["fwd_near"] * ODO["mps_per_unit"] / DOCK["hz"]
+        await _dock_send(-DOCK["fwd_near"], 0.0)
         _dock_log_tick("retreat", "z=%s" % (tag and tag.get("z_m")))
         await asyncio.sleep(1.0 / DOCK["hz"])
     await _dock_send(0, 0)
@@ -2947,7 +2953,12 @@ async def _dock_stage_turn():
     _dock_set("turn", "180° — spinning until the rear camera sees the dock")
     while True:
         if time.time() - t0 > DOCK["spin_timeout_s"]:
-            await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("turn_timeout", "spun for %ds without the rear camera finding the dock" % DOCK["spin_timeout_s"]); return False
+            await _dock_send(0, 0); _dock["state"] = "failed"
+            if _dock.get("_turn_last_x") is not None:
+                _dock_set("turn_timeout", "rear camera had the dock (%+d%%) but %ds of pulses could not centre it" % (int(_dock["_turn_last_x"] * 100), DOCK["spin_timeout_s"]))
+            else:
+                _dock_set("turn_timeout", "spun for %ds without the rear camera finding the dock" % DOCK["spin_timeout_s"])
+            return False
         await _dock_send(0, DOCK["spin"] * sign)
         await asyncio.sleep(DOCK["pulse_s"])
         see = await _dock_settled_look("rear")          # stop · settle · look (no motion blur)
@@ -2974,7 +2985,10 @@ async def _dock_stage_turn():
             direction = sign; m = None; x_prev = tag["x_err"]
             for _ in range(20):
                 await _dock_send(0, DOCK["spin"] * direction)
-                await asyncio.sleep(DOCK["pulse_turn_s"] * (1.0 if abs(x_prev) > 0.2 else 0.5))
+                # ★ Sep 7 (run 14:00): the turn converged to -16% and then sat there for 50 s. The pulse halved to
+                #   0.15 s under 20% error - too short to break the wheels loose on this floor, so every pulse was a
+                #   command that produced no motion. Floor the pulse at 0.25 s; trim the rate, not the duration.
+                await asyncio.sleep(max(0.25, DOCK["pulse_turn_s"] * (1.0 if abs(x_prev) > 0.2 else 0.75)))
                 see = await _dock_settled_look("rear"); t2 = see and see.get("tag")
                 _dock_log_tick("turn", "centering %+d%% dir %+d" % (int((t2 or tag)["x_err"] * 100), direction))
                 if not t2:
@@ -2984,7 +2998,7 @@ async def _dock_stage_turn():
                         break
                 if m is None and abs(t2["x_err"] - x_prev) > 0.02:
                     m = 1 if (t2["x_err"] - x_prev) * direction > 0 else -1   # +1: this direction moves the tag toward +x
-                tag = t2; x_prev = tag["x_err"]
+                tag = t2; x_prev = tag["x_err"]; _dock["_turn_last_x"] = x_prev
                 if abs(tag["x_err"]) < 0.05:
                     hit = True; break
                 if m is not None:
@@ -3575,7 +3589,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0, "_back_seg_done": 0.0, "_back_seg_t": None, "_last_z": None})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0, "_back_seg_done": 0.0, "_back_seg_t": None, "_last_z": None, "_turn_last_x": None})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
