@@ -3696,6 +3696,17 @@ async def _dock_self_calibrate(reason: str):
         logger.warning("dock: self-calibration failed: %s", e)
 
 
+def _dock_cal():
+    """Every number a dock calibration produces, in one place, so Connect can keep it across SDK deploys and
+    per listing. Per-rover (camera) values and per-dock (mounting) values travel together; a new listing simply
+    re-runs the buttons and the record updates."""
+    return {"range_k": _dock.get("range_k", DOCK["range_k"]), "horizon_y": _dock.get("horizon_y", DOCK["horizon_y"]),
+            "wall_slope_bias": _dock.get("wall_slope_bias", DOCK["wall_slope_bias"]), "wall_slope_bias_high": _dock.get("wall_slope_bias_high", DOCK["wall_slope_bias_high"]),
+            "xmark_bias": _dock.get("xmark_bias", DOCK["xmark_bias"]), "fix": _dock.get("fix"), "seat_ref": _dock.get("seat_ref"),
+            "home": {"set": bool(_odo.get("home_set")), "hdg": _odo.get("home_hdg")} if isinstance(globals().get("_odo"), dict) else None,
+            "calibrated": bool(_dock.get("fix")) and _dock.get("range_k") is not None}
+
+
 def _dock_status():
     return {"return": _return_status(), "odo": _odo_pos(), "seat_ref": _dock.get("seat_ref"), "active": _dock_active(), "state": _dock["state"], "phase": _dock["phase"], "reason": _dock["reason"], "cam": _dock["cam"], "progress": _dock_progress(),
             "sense": _dock["sense"], "mirror": _dock["mirror"], "sign": _dock["sign"], "heading": _dock_heading(),
@@ -3734,6 +3745,7 @@ async def _dock_target_lock():
 @app.get("/dock")
 async def dock_get():
     st = _dock_status()
+    st["cal"] = _dock_cal()
     if not st.get("active"):
         try:
             st["lock"] = await _dock_target_lock()
@@ -3822,6 +3834,18 @@ async def dock_post(request: Request):
         logger.info("dock: X SIGHT ZEROED at %+.3f tag-widths  → set DOCK_XMARK_BIAS=%s to keep it across deploys", off, off)
         _docklog_event("xmark_zero", "sight zeroed: bias %+.3f" % off)
         return {"ok": True, "bias": off}
+    if action == "set_cal":
+        # Connect restoring a stored calibration (after an SDK deploy, or when a rover moves to a listing it has docked at before)
+        c = (body or {}).get("cal") or {}
+        for kk in ("range_k", "horizon_y", "wall_slope_bias", "wall_slope_bias_high", "xmark_bias"):
+            if c.get(kk) is not None:
+                _dock[kk] = float(c[kk])
+        if c.get("fix"):
+            _dock["fix"] = dict(c["fix"]); DOCK["fix_m"] = float(c["fix"].get("z_m") or DOCK["fix_m"]); DOCK["fix_side_px"] = float(c["fix"].get("side_px") or 0)
+        if c.get("seat_ref"):
+            _dock["seat_ref"] = dict(c["seat_ref"])
+        logger.info("dock: calibration restored from Connect: %s", {k: c.get(k) for k in ("range_k", "xmark_bias", "fix")})
+        return {"ok": True, "cal": _dock_cal()}
     if action == "set_seat":
         seat = (body or {}).get("seat") or {}
         if seat.get("width") and seat.get("cx") is not None:
