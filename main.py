@@ -1735,13 +1735,26 @@ def _dock_wall_bar(g, w, h, fx, tag):
             prof = g[y0:y1, x - 2:x + 3].mean(axis=1); grad = np.diff(prof)
             if len(grad) < 6:
                 continue
-            i_top = int(np.argmin(grad))     # light → dark (top edge of the bar)
-            i_bot = int(np.argmax(grad))     # dark → light (bottom edge)
-            # ★ the bar fired on standing frames and vanished on moving ones: motion blur softens the edges
-            #   below a fixed 25-level step. Threshold on THIS column's contrast instead.
-            thr = max(9.0, 0.3 * float(prof.max() - prof.min()))
-            if i_bot > i_top + 3 and -grad[i_top] > thr and grad[i_bot] > thr and (i_bot - i_top) < side * 0.6:
-                tops.append((x, y0 + i_top)); bots.append((x, y0 + i_bot))
+            # ★ Sep 7: "MOVING YOU UP" is printed white INSIDE the bar, so raw gradient peaks land on the letters,
+            #   not the bar. Smooth the column over ~a fifth of the bar's thickness, then take the darkest THICK
+            #   band's top and bottom as the edges. Letters average out; the bar does not.
+            k = max(3, int(side * 0.08))
+            ps = np.convolve(prof, np.ones(k) / k, mode="same")
+            lo, hi_ = float(ps.min()), float(ps.max())
+            if hi_ - lo < 25:
+                continue
+            dark = ps < (lo + hi_) / 2.0
+            best = None; run_s = None
+            for i in range(len(dark) + 1):
+                on = i < len(dark) and dark[i]
+                if on and run_s is None:
+                    run_s = i
+                elif (not on) and run_s is not None:
+                    if best is None or (i - run_s) > (best[1] - best[0]):
+                        best = (run_s, i)
+                    run_s = None
+            if best and side * 0.15 <= (best[1] - best[0]) <= side * 0.7:
+                tops.append((x, y0 + best[0])); bots.append((x, y0 + best[1]))
         if len(tops) < 5:
             return None
         def fit(pts):
@@ -2297,13 +2310,27 @@ async def _dock_stage_one(learner):
 
 
 async def _dock_retreat(learner, to_m: float):
-    """Back straight away from the dock, front camera holding the tag centered, until z ≥ to_m."""
+    """Back straight away from the dock, front camera holding the tag centered, until z ≥ to_m.
+    ★ Sep 7 (run 13:33, "backing out to 0.0 m", then out of the room): the target came in as zero and the loop
+    kept reversing BLIND for 12 s while the tag was not decoded. Three guards now: the target is never below the
+    fix distance, two seconds without the tag stops the retreat (a blind reverse is how a rover leaves a room),
+    and it never backs more than a metre in one retreat."""
+    F = (_dock.get("fix") or {}).get("z_m") or DOCK["fix_m"]
+    if not to_m or to_m < 1.0:
+        to_m = F
     _dock_set("retreat", "too close to fix the angle - backing out to %.1f m" % to_m)
-    t0 = time.time()
+    t0 = time.time(); last_tag = time.time(); backed = 0.0
     while time.time() - t0 < 12:
         fr = await _dock_frame("front"); see = dock_see(fr.jpeg, "front") if fr else None; tag = see and see.get("tag")
         if tag and tag.get("z_m") is not None and tag["z_m"] >= to_m:
             break
+        if tag:
+            last_tag = time.time()
+        elif time.time() - last_tag > 2.0:
+            _docklog_event("retreat", "tag not seen for 2 s while backing out - stopping (no blind reverse)"); break
+        if backed >= 1.0:
+            _docklog_event("retreat", "backed 1.0 m without reaching %.1f m - stopping" % to_m); break
+        backed += DOCK["fwd_near"] * ODO["mps_per_unit"] / DOCK["hz"]
         ang = 0.0
         if tag and abs(tag["x_err"]) >= 0.05:
             # ★ Sep 6, straight off the live feed: backing out under this "opposite sense" sign took
@@ -2700,7 +2727,7 @@ async def _dock_stage_approach():
             #   of the frame inside ~1.3 m) the decision is FROZEN - straight in, no more axis work.
             sight_live = xmark_med is not None and all((v > 0) == (xmark_med > 0) for v in xh)
             if _dock.get("_stage1_pass"):
-                sight_live = False; yaw_ok = False; yaw_med = 0.0; awm = 0.0   # stage one settled the axis: fly straight, trim only
+                sight_live = False; yaw_ok = False; yaw_med = 0.0   # stage one settled the axis: fly straight, trim only
             if sight_live:
                 _dock["_sight_seen"] = True
                 if abs(xmark_med) >= DOCK["xmark_ok"]:
@@ -2714,7 +2741,6 @@ async def _dock_stage_approach():
                     yaw_ok = False; yaw_med = 0.0          # the sight says straight on: nothing else may argue
             elif _dock.get("_sight_seen") and z < 1.4:
                 yaw_ok = False; yaw_med = 0.0              # sight gone close in: frozen, fly straight
-                awm = 0.0
             # ★ "close to measure": with no solid yaw beyond ~1.3 m, drive straight until the tag is big enough,
             #   then STOP and take a proper reading (several settled looks) before deciding anything. "Get
             #   closer" and "may manoeuvre" used to be the same threshold, so the decision always came too late.
