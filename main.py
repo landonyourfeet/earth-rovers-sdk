@@ -2838,6 +2838,19 @@ async def _dock_stage_approach():
                     y_m = sorted(ys)[len(ys) // 2] if ys else None
                     noise = looks[0][2]
                     yaw_measurable = y_m is not None and len(ys) >= 3 and abs(y_m) > noise * 0.45   # a consistent reading above half the noise band is real
+                    # ★ Sep 7 (run 16:35, Cap: "it stopped, made no course adjustment, and backed all the way to 2 m
+                    #   until exhaustion"): the gate refused +4% and +5% - a metre of final drifts the nose a few
+                    #   percent, and that is a HEADING error a skid-steer fixes in place with one pulse. Correct first;
+                    #   only a rover that cannot be centred by rotating (off the AXIS, not off the aim) goes back out.
+                    if abs(xe_m) > 0.03 and abs(xe_m) <= 0.15 and (not yaw_measurable or abs(y_m) <= 8):
+                        for _ in range(3):
+                            await _dock_pulse_turn(learner.sign() * xe_m, "front")
+                            sv = await _dock_settled_look("front"); tv = sv and sv.get("tag")
+                            if tv:
+                                xe_m = tv["x_err"]
+                                if abs(xe_m) <= 0.03:
+                                    break
+                        _docklog_event("turn_gate", "trimmed the aim in place → centred %+.2f" % xe_m)
                     lined = abs(xe_m) <= 0.03 and (not yaw_measurable or abs(y_m) <= 8)
                     if lined:
                         _dock_set("staged", "%.2f m from the stand · centered %+d%% · yaw %s — lined up, turning" % (z, int(xe_m * 100), ("%+d°" % y_m) if y_m is not None else "—"))
