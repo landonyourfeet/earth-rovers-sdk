@@ -3092,7 +3092,28 @@ async def _dock_stage_back():
                     break
             sv = await _dock_settled_look("rear"); tv = sv and sv.get("tag"); shv = sv and sv.get("sheet")
             xe = tv["x_err"] if tv else (shv["x_err"] if shv else x_err)
-            if abs(xe) > tol:
+            zv = (tv.get("z_m") if tv else None) or 0.0
+            # ★ Sep 7 (run 20:13, Cap: "still only correcting to put the bar in the middle - must OVER-correct to
+            #   actually line up"): `lat +0.07` sat there for four stop-and-adjust cycles while every pulse re-centred
+            #   the TAG. Centring the tag is aim, not position. The fix: aim the tail at the point on the AXIS
+            #   halfway to the dock. Same lateral offset, half the depth → its bearing is TWICE the tag's, so
+            #   centring it puts the tag on the far side of centre by the amount it started (mirrored). Backing
+            #   straight then walks the rover onto the axis and squares it at once, and the target bearing shrinks
+            #   to zero as the offset does, so it cannot oscillate. Inside 0.55 m the tag itself is the target.
+            if zv >= 0.55 and abs(xe) > tol:
+                target = max(-0.14, min(0.14, -xe))          # mirror across centre = aiming at the halfway axis point
+                _dock_set("align_rear", "stopped · tag %+d%% - over-correcting to %+d%% to walk onto the axis" % (int(xe * 100), int(target * 100)))
+                for _ in range(4):
+                    await _dock_pulse_turn(learner.sign() * (xe - target), "rear"); learner.observe(xe - target, True)
+                    sv = await _dock_settled_look("rear"); tv = sv and sv.get("tag")
+                    if not tv:
+                        break
+                    xe = tv["x_err"]
+                    if abs(xe - target) <= 0.03:
+                        break
+                _dock_log_tick("back", "over-correct → tag %+.2f (target %+.2f)" % (xe, target))
+                await _dock_send(0, 0); await asyncio.sleep(0.3)
+            elif abs(xe) > tol:
                 _dock_set("align_rear", "stopped · %+d%% off center - one adjustment in place" % int(xe * 100))
                 await _dock_pulse_turn(learner.sign() * xe, "rear"); learner.observe(xe, True)
                 _dock_log_tick("back", "stop-adjust %+.2f" % xe)
@@ -3171,7 +3192,11 @@ async def _dock_final_checkpoint(label: str, cx0: float):
     if err is None:
         _dock_set("final", "%s checkpoint: nothing to center on - continuing straight" % label)
         _docklog_event("checkpoint", "%s: no centering cue in the rear frame" % label); return
-    if abs(err) <= 0.04:
+    # ★ Sep 7 (Cap's hand-dock, measured off the raw rear frame): the bar's midpoint sat 9.5 px off centre on a
+    #   480-px frame - a tenth of an inch - and it charged. That is the seat tolerance. The 6-inch checkpoint holds
+    #   the last correction to 2% of frame (≈0.1 in); the 1-ft checkpoint stays at 4%.
+    tol_cp = 0.02 if label.startswith("6") else 0.04
+    if abs(err) <= tol_cp:
         _dock_set("final", "%s checkpoint: centered (%s %+.0f%%) - continuing straight" % (label, src, err * 100))
         _docklog_event("checkpoint", "%s: centered by %s (%+.2f)" % (label, src, err)); return
     _dock_set("final", "%s checkpoint: %s %+.0f%% off - one small correction" % (label, src, err * 100))
