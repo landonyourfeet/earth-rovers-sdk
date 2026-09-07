@@ -1146,7 +1146,8 @@ DOCK = {
     #   know it isn't done because it's not receiving charge." Qi coils need ~3 cm alignment.
     "final_lat_m": float(os.getenv("DOCK_FINAL_LAT_M", "0.06")),    # lateral offset allowed before the final seat (the seat marks steer the rest)
     "final_yaw_deg": float(os.getenv("DOCK_FINAL_YAW_DEG", "6")),
-    "reseat_m": float(os.getenv("DOCK_RESEAT_M", "0.35")),           # pull forward this far to try again
+    "reseat_m": float(os.getenv("DOCK_RESEAT_M", "0.35")),
+    "back_seg_m": float(os.getenv("DOCK_BACK_SEG_M", "0.25")),        # ★ straight back-in segments between stop-and-look checks           # pull forward this far to try again
     "reseat_max": int(os.getenv("DOCK_RESEAT_MAX", "3")),
     # Sep 5 12:35 - Cap's MANUAL dock that charged (+6%/hr), measured from his rear-cam screenshot: the tag's
     #   black square sits centered (x_err -0.014) with its bottom edge at 55% of frame height and a WIDTH of
@@ -2993,21 +2994,36 @@ async def _dock_stage_back():
             await _dock_offaxis_fix(learner)
             rev_since = None; _dock["last_seen"] = None; continue
         near = bool(tag and (tag["side_px"] >= DOCK["tag_near_px"] or (tag.get("z_m") is not None and tag["z_m"] < 0.7))) or bool(sheet and sheet["ratio"] >= 0.45)
-        angular = max(-DOCK["turn_max"], min(DOCK["turn_max"], learner.sign() * x_err * DOCK["turn_gain"]))
         tol = DOCK["center_tol"] * (0.6 if near else 1.0)   # tighter as the stand gets close
-        if abs(x_err) > 0.30:
-            # big error: one alignment pulse, then look again (never a continuous spin)
-            _dock_set("align_rear", "lining up (rear) · " + ref); rev_since = None
-            await _dock_pulse_turn(learner.sign() * x_err, "rear")
-            learner.observe(x_err, True)
-            _dock_log_tick("back", "pulse")
+        # ★ Cap (Sep 6 evening): "the droid tried to turn while driving forward - not ok. Stop, then adjust only if
+        #   needed, at least twice on final approach." No steering while moving, ever, from here to the stand:
+        #   the back-in is STRAIGHT segments of ~25 cm (by odometry), and between segments the rover STOPS,
+        #   looks, and pulses in place only when the picture is off center. Then straight again.
+        seg_m = DOCK.get("back_seg_m", 0.25)
+        if _dock.get("_back_seg_done", 0.0) >= seg_m or _dock.get("_back_seg_t") is None:
+            # end of a segment (or the very first one): stop and look
+            await _dock_send(0, 0)
+            for _ in range(int(1.0 * DOCK["hz"])):
+                await asyncio.sleep(1.0 / DOCK["hz"]); await _dock_send(0, 0)
+                if abs(float((telemetry_hub.latest or {}).get("speed") or 0.0)) <= 0.02:
+                    break
+            sv = await _dock_settled_look("rear"); tv = sv and sv.get("tag"); shv = sv and sv.get("sheet")
+            xe = tv["x_err"] if tv else (shv["x_err"] if shv else x_err)
+            if abs(xe) > tol:
+                _dock_set("align_rear", "stopped · %+d%% off center - one adjustment in place" % int(xe * 100))
+                await _dock_pulse_turn(learner.sign() * xe, "rear"); learner.observe(xe, True)
+                _dock_log_tick("back", "stop-adjust %+.2f" % xe)
+                await _dock_send(0, 0); await asyncio.sleep(0.3)
+            else:
+                _dock_log_tick("back", "stop-check ok %+.2f" % xe)
+            _dock["_back_seg_done"] = 0.0; _dock["_back_seg_t"] = time.time()
+            rev_since = None
             continue
-        else:
-            angular = max(-0.25, min(0.25, angular))
-            if abs(x_err) < tol:
-                angular = 0.0
-            linear = -(DOCK["rev_near"] if near else DOCK["rev"])
-            _dock_set("back", "backing onto the mat · " + ref)
+        angular = 0.0
+        linear = -(DOCK["rev_near"] if near else DOCK["rev"])
+        _dock["_back_seg_done"] = _dock.get("_back_seg_done", 0.0) + abs(linear) * ODO["mps_per_unit"] * (1.0 / DOCK["hz"])
+        if True:
+            _dock_set("back", "backing straight · segment %.0f/%.0f cm · " % (_dock["_back_seg_done"] * 100, seg_m * 100) + ref)
             rev_since = rev_since or now
             if now - rev_since > DOCK["stall_s"] and (_dock_rpms_zero() or _dock_speed_zero()):
                 # ★ run 7 log: "docked - wheels stalled" fired 50 cm from the sheet, turned 45°, stuck on the
@@ -3463,7 +3479,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0, "_back_seg_done": 0.0, "_back_seg_t": None})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
