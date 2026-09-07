@@ -1815,15 +1815,37 @@ def dock_wall(img, cam="front", tag=None):
         #   stable -7° raw into +66.9°. Near the horizon the conversion is SINGULAR, not just weak. Two answers:
         #   gate it (|dy| < 40 → not measurable), and read a HIGH wall line too - ceiling, sill, door top - where
         #   |dy| is 100+ px and the same formula is well conditioned. Whichever line is better conditioned wins.
-        cands = []
-        if abs(dy) >= 40:
+        # ★ Sep 7 morning (run 12:58): the floor candidate was fitted 41 px ABOVE the horizon - floorboards running
+        #   toward the wall, a crisp line at exactly the wrong angle - and it out-scored the true reference on fit
+        #   quality alone. q measures how well points fit a line, not whether it is the right line. Candidates are
+        #   VALIDATED before they are ranked: a floor line above the horizon is impossible; any line implying more
+        #   than 45° of heading at the fix is not a wall; and the printed bar, coplanar with the tag by construction,
+        #   wins whenever it reads.
+        cands = []; rejected = []
+        def _phi_of(slope, dyv):
+            return abs(math.degrees(math.atan(slope * fx0 / dyv))) if dyv else 999.0
+        if dy <= 0:
+            rejected.append("floor: above the horizon (dy %d) - not a floor line" % round(float(dy)))
+        elif dy < 40:
+            rejected.append("floor: too near the horizon (dy %d)" % round(float(dy)))
+        elif _phi_of(sl, dy) > 45:
+            rejected.append("floor: implies %.0f° - not a wall" % _phi_of(sl, dy))
+        else:
             cands.append(("floor", sl, dy, low["q"]))
         hi = _dock_wall_bar(g, w, h, fx0, tag) or _dock_wall_high_line(g, w, h, fx0)
-        if hi and abs(hi["dy"]) >= 40 and (hi.get("bar") or hi["q"] >= 0.6):
-            cands.append(("bar" if hi.get("bar") else "high", hi["slope"], hi["dy"], hi["q"]))
+        if hi:
+            if abs(hi["dy"]) < 40:
+                rejected.append("high: too near the horizon (dy %d)" % hi["dy"])
+            elif _phi_of(hi["slope"], hi["dy"]) > 45:
+                rejected.append("high: implies %.0f° - not a wall" % _phi_of(hi["slope"], hi["dy"]))
+            elif hi.get("bar") or hi["q"] >= 0.6:
+                cands.append(("bar" if hi.get("bar") else "high", hi["slope"], hi["dy"], hi["q"]))
+            else:
+                rejected.append("high: weak fit (q %.2f)" % hi["q"])
         if not cands:
-            return {"phi": None, "why": "no wall line far enough from the horizon (floor dy %d%s)" % (round(float(dy)), (", high dy %d" % hi["dy"]) if hi else ""), "floor": low, "high": hi}
-        src, sl_u, dy_u, q_u = max(cands, key=lambda c: abs(c[2]) * c[3])
+            return {"phi": None, "why": "no valid wall line: " + "; ".join(rejected), "floor": low, "high": hi}
+        bar = [c for c in cands if c[0] == "bar"]
+        src, sl_u, dy_u, q_u = bar[0] if bar else max(cands, key=lambda c: abs(c[2]) * c[3])
         sl_c = sl_u - (_dock.get("wall_slope_bias", DOCK["wall_slope_bias"]) if src == "floor" else _dock.get("wall_slope_bias_high", DOCK["wall_slope_bias"]))
         phi = -math.degrees(math.atan(sl_c * fx / dy_u))
         return {"phi": round(float(phi), 1), "src": src, "raw": round(float(-math.degrees(math.atan(sl_u * fx / dy_u))), 1), "slope": round(float(sl_u), 4), "dy": round(float(dy_u)), "q": round(float(q_u), 2), "floor": low, "high": hi}
@@ -2169,6 +2191,15 @@ async def _dock_stage_one(learner):
                 d_x = abs(xm) * DOCK["tag_m"] * (max(D, 0.5) + DOCK["xmark_depth_m"]) / DOCK["xmark_depth_m"]
                 lat = (1 if xm > 0 else -1) * max(0.15, min(1.5, d_x))
                 xr = lat
+            # ★ the wall's heading must AGREE with the geometry the X and the bearing imply. The rover just centered
+            #   the tag by rotation, so its heading off the axis is asin(lat / D): with 25 cm of offset at 1.85 m that
+            #   is 8°, not the 75° the floorboards claimed. A wall angle that contradicts the X by more than 20° is
+            #   dropped - heading comes from the X geometry and the plan is sized from THAT. Never averaged.
+            phi_geo = -math.degrees(math.asin(max(-0.95, min(0.95, lat / max(D, 0.5))))) - beta
+            if abs(phi - phi_geo) > 20:
+                _docklog_event("stage1", "wall φ %+.0f° contradicts the X-sight geometry (φ %+.0f° from %.2f m off the axis) - wall dropped for this plan" % (phi, phi_geo, lat))
+                phi = phi_geo
+                a = math.radians(phi + beta); xr = -D * math.sin(a); yr = D * math.cos(a); lat = xr
         if xm is not None and not cross and abs(lat) > 0.15 and abs(xm) > 0.15 and False:
             _docklog_event("stage1", "two sensors disagree on the side - not planning on either (%d/3)" % (attempt + 1))
             await _dock_retreat(learner, F + 0.3)
