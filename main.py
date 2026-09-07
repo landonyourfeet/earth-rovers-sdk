@@ -2602,14 +2602,39 @@ async def _dock_stage_approach():
         if not tgt:
             # a moving frame said nothing — stop and look before believing it
             see = await _dock_settled_look("front"); tag = see and see.get("tag"); sheet = see and see.get("sheet") if not (see and see.get("sheet") and _dock_blacklisted("front", see["sheet"]["x_err"])) else None; tgt = tag or sheet
+        if not tgt and _dock.get("_last_z") and _dock["_last_z"] < 1.6:
+            # ★ close in, the tag does not vanish sideways - it drops out of decode (blur, glare, a frame). Look twice
+            #   more, then back straight out 30 cm and look again. Spinning here is how the rover ends up facing away.
+            for _ in range(2):
+                await _dock_send(0, 0); await asyncio.sleep(0.6)
+                see = await _dock_settled_look("front"); tag = see and see.get("tag"); tgt = tag or (see and see.get("sheet"))
+                if tgt:
+                    break
+            if not tgt:
+                _dock_set("relook", "tag dropped out at %.2f m - backing out 30 cm to look again" % _dock["_last_z"])
+                await _dock_send(DOCK["rev"], 0.0) if False else await _dock_send(-DOCK["rev"], 0.0)
+                await asyncio.sleep(0.30 / (DOCK["rev"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                see = await _dock_settled_look("front"); tag = see and see.get("tag"); tgt = tag or (see and see.get("sheet"))
         if not tgt:
             # look BEHIND first: if the rear camera already has the dock we are facing away — skip the approach and turn
             try:
                 if await browser_service.has_rear_camera():
                     rs = await _dock_settled_look("rear"); rt = rs and rs.get("tag"); rsh = rs and rs.get("sheet")
                     _docklog_event("rear_look", "rear camera: %s" % ("TAG" if rt else ("sheet %d%%" % int(rsh["ratio"] * 100) if rsh else "nothing")))
-                    if rt or (rsh and rsh["ratio"] >= DOCK["sheet_confirm"] and not _dock_blacklisted("rear", rsh["x_err"])):
-                        _dock["cam"] = "rear"; _dock_set("rear_first", "dock is behind us already — skipping the approach and turn"); return "back"
+                    # ★ Sep 7 (run 13:18): a sweep caught "sheet 1%" behind the rover 1.3 m out and 34% off center, and the
+                    #   old shortcut skipped the approach AND the turn and backed in from there. Retired. The 180 is a
+                    #   manoeuvre we run on purpose after a lined-up front approach; a dock seen behind us is a dock to
+                    #   turn and FACE. (Only a decoded rear TAG, centred, inside the turn point, counts as "already staged".)
+                    if rt and abs(rt["x_err"]) <= 0.05 and rt.get("z_m") and abs(rt["z_m"] - DOCK["stage_m"]) <= 0.25:
+                        _dock["cam"] = "rear"; _dock_set("rear_first", "already staged: rear tag centred at %.2f m — backing in" % rt["z_m"]); return "back"
+                    if rt or rsh:
+                        _docklog_event("rear_look", "dock is behind us — turning to face it and flying the approach properly")
+                        for _ in range(30):
+                            await _dock_pulse_turn(1.0, "front")
+                            fs = await _dock_settled_look("front")
+                            if fs and (fs.get("tag") or fs.get("sheet")):
+                                break
+                        _dock["cam"] = "front"; faced_since = None; continue
                     _dock["cam"] = "front"
             except Exception:
                 pass
@@ -2620,13 +2645,19 @@ async def _dock_stage_approach():
                 await _dock_send(0, 0); _dock["state"] = "failed"; _dock_set("no_target", "swept a full circle and never saw the dock"); return False
             cam, see = hit
             if cam == "rear":
-                _dock["cam"] = "rear"; _dock_set("rear_first", "dock found behind us — skipping the approach and turn"); return "back"
+                _docklog_event("search_hit", "sweep found the dock behind us — turning to face it (no shortcut into the back-in)")
+                for _ in range(30):
+                    await _dock_pulse_turn(1.0, "front")
+                    fs = await _dock_settled_look("front")
+                    if fs and (fs.get("tag") or fs.get("sheet")):
+                        break
+                _dock["cam"] = "front"
             faced_since = None
             continue
         _dock["last_seen"] = now
         # ---- with a pose ----
         if tag and tag.get("z_m") is not None:
-            z = tag["z_m"]; x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0
+            z = tag["z_m"]; x_err = tag["x_err"]; lat = tag.get("x_m") or 0.0; _dock["_last_z"] = z
             far_offaxis = False   # the staging-point chase is retired; the crab manoeuvre below handles off-axis
             # ★ Sep 6 - the veer. Yaw now comes from _dock_yaw() (runway lines, or the tag only when it is
             #   big enough to measure), it has to clear its own noise band, and it has to be repeatable
@@ -3518,7 +3549,7 @@ async def return_post(request: Request):
 
 
 async def _dock_loop():
-    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0, "_back_seg_done": 0.0, "_back_seg_t": None})
+    _dock.update({"state": "docking", "started_at": time.time(), "last_seen": None, "sense": None, "reason": None, "cmds": 0, "cam": None, "_reseat_runs": 0, "_crab_n": 0, "_crab_side": None, "_yaw_hist": [], "_normal_sign": 1.0, "_measured_once": False, "_xmark_hist": [], "_sight_seen": False, "_sight_d": None, "_crab_side_hint": None, "_stage1_done": False, "_stage1_pass": False, "_stage_gate_fails": 0, "_back_seg_done": 0.0, "_back_seg_t": None, "_last_z": None})
     _docklog_reset()
     _docklog_event("start", "self-dock started", {"mirror": dict(_dock["mirror"]), "sign": dict(_dock["sign"]), "heading": _dock_heading(), "battery": (telemetry_hub.latest or {}).get("battery")})
     _dock_set("acquire")
