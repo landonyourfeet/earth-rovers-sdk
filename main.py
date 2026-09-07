@@ -2235,6 +2235,24 @@ async def _dock_stage_one(learner):
             _docklog_event("stage1", "verify at the fix: %s → not yet" % (("lateral %+.2f m, heading %s" % (v["x"], v["theta"])) if v else "no read"))
             continue
         # steer to the FIX (0, F): its bearing from here, in the rover's frame (right-positive)
+        # ★ Cap: "if already on centre, no need to go off centre." On the axis already (within the fix tolerance) the
+        #   rover does NOT manoeuvre: it centres the tag (heading only) and drives straight to the fix distance. The
+        #   base-leg logic below only runs for a rover that is actually beside the axis.
+        if abs(x) <= DOCK["fix_lat_m"]:
+            _dock_set("stage1", "on the axis (%+.0f cm) · %.2f m out - no manoeuvre, closing straight to the fix" % (x * 100, z))
+            for _ in range(8):
+                sv = await _dock_settled_look("front"); t = sv and sv.get("tag")
+                if not t or abs(t["x_err"]) <= 0.03:
+                    break
+                await _dock_pulse_turn(learner.sign() * t["x_err"], "front")
+            if z > F + 0.6:
+                seg_m = min(0.45, z - F)
+                await _dock_send(DOCK["fwd"], 0.0); await asyncio.sleep(seg_m / (DOCK["fwd"] * ODO["mps_per_unit"])); await _dock_send(0, 0)
+                _dock_log_tick("stage1", "straight %.2f m toward the fix (already on the axis)" % seg_m)
+                await asyncio.sleep(0.3)
+            elif z < F - 0.6:
+                await _dock_retreat(learner, F)
+            continue
         # dock frame: x = metres right of the axis, z = metres out from the wall. The fix is at (0, F).
         # The rover faces the wall (θ ≈ 0 → looking at z decreasing). Vector to the fix: lateral −x, depth F − z.
         vx, vz = 0.0 - x, F - z
