@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import signal
+import tempfile
 import time
 from typing import Optional
 
@@ -149,13 +150,39 @@ def sdk_page_error(status: int, body: str, token_error: Optional[str]) -> str:
     return msg[:400]
 
 
-def launch_diagnosis(err_text: str, console: list) -> str:
+# ★ OKCREAL (Oct 19, 2026 — RV2d): myRover2's Chrome starts but a page never opens ("hung for 120 s while opening a browser page"),
+#   and Playwright says nothing about why. Chrome writes its own log to a file (--enable-logging --log-file); after a failed or hung
+#   launch the lines that say why (FATAL, a crash, shared memory, the GPU or zygote, out of memory) join the diagnosis.
+_CHROME_LOG_NOISE = re.compile(r":CONSOLE[:(]|dbus|Failed to connect to the bus|fontconfig|gcm|google_apis|ALSA|pulse|UPower|libva|vaapi|"   # page console lines are told as "page said"
+                               r"ssl_client_socket|registration_request|voice_transcription|on_device_model|optimization_guide", re.I)
+_CHROME_LOG_WHY = re.compile(r"FATAL|Check failed|crash|shared.?memory|/dev/shm|No space|zygote|sandbox|renderer|gpu|out of memory|"
+                             r"OOM|Bus error|SIGBUS|SIGSEGV|SIGKILL|ERROR", re.I)
+
+
+def chrome_log_lines(text: str) -> list:
+    """The lines of Chrome's own log that explain a failed launch (noise like D-Bus left out), shortened, newest last."""
+    out = []
+    for raw in str(text or "").splitlines()[-400:]:
+        line = raw.strip()
+        if not line or _CHROME_LOG_NOISE.search(line) or not _CHROME_LOG_WHY.search(line):
+            continue
+        line = re.sub(r"^\[[^\]]*\]\s*", "", line)   # [pid:tid:date:LEVEL:file(line)] prefix — keep the words
+        line = line[:200]
+        if line not in out:
+            out.append(line)
+    return out[-3:]
+
+
+def launch_diagnosis(err_text: str, console: list, chrome_log: Optional[list] = None) -> str:
     lines = str(err_text or "").split("\n")
     first = lines[0].strip() or "browser launch failed"
     parts = [first]
     chrome = [l.strip() for l in lines[1:] if l.strip() and _CHROME_WHY.search(l)]
     if chrome:
         parts.append("chrome: " + " | ".join(chrome[-2:])[:200])
+    browser_down = bool(re.search(r"closed|crash|target|hung", first, re.I))
+    if chrome_log and browser_down:   # only when Chrome itself failed — a rover-link failure is told by what the page said
+        parts.append("chrome log: " + " | ".join(chrome_log[-3:])[:260])
     said = []
     for c in console:
         if _PAGE_WHY.search(c) and c not in said:
@@ -166,7 +193,7 @@ def launch_diagnosis(err_text: str, console: list) -> str:
     pick = (strong[-2:] + weak[-1:]) if strong else weak[-3:]
     if pick:
         parts.append("page said: " + " | ".join(pick)[:260])
-    if re.search(r"closed|crash|target", first, re.I) or chrome:
+    if browser_down or chrome:
         parts.append("host: " + host_facts_text())
     return " · ".join(parts)[:600]
 
@@ -235,12 +262,26 @@ class BrowserService:
                 self.last_error = launch_diagnosis(
                     f"the browser launch hung for {int(LAUNCH_TIMEOUT_S)} s while {step} — closed it to try again",
                     list(self._console),
+                    self._chrome_log_tail(),
                 )
                 self.last_error_at = time.time()
                 logger.error("Launch diagnosis: %s", self.last_error)
                 await self._hard_reset()
                 raise RuntimeError(self.last_error)
             return self._page
+
+    def _chrome_log_tail(self) -> list:
+        path = getattr(self, "_chrome_log_path", None)
+        if not path:
+            return []
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 64000))
+                return chrome_log_lines(f.read().decode("utf-8", "replace"))
+        except Exception:
+            return []
 
     async def _hard_reset(self):
         # a hung launch: close what we can (never waiting long on a dead browser), then drop the driver so the next try starts clean.
@@ -271,9 +312,15 @@ class BrowserService:
                 self._playwright = await async_playwright().start()
             self.launch_step = "launching Chrome"
 
+            self._chrome_log_path = os.path.join(tempfile.gettempdir(), f"okc-chrome-{os.getpid()}.log")
+            with contextlib.suppress(Exception):
+                os.remove(self._chrome_log_path)
             launch_kwargs = {
                 "headless": True,
                 "args": [
+                    "--enable-logging",
+                    f"--log-file={self._chrome_log_path}",
+                    "--v=0",
                     "--ignore-certificate-errors",
                     "--no-sandbox",
                     "--autoplay-policy=no-user-gesture-required",
@@ -358,7 +405,7 @@ class BrowserService:
             self.last_error = None
             logger.info("Headless browser connected to %s", SDK_PAGE_URL)
         except Exception as e:
-            self.last_error = launch_diagnosis(str(e), list(self._console))
+            self.last_error = launch_diagnosis(str(e), list(self._console), self._chrome_log_tail())
             self.last_error_at = time.time()
             logger.error("Error initializing browser: %s", e)
             logger.error("Launch diagnosis: %s", self.last_error)

@@ -308,3 +308,43 @@ class LaunchWatchdogTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 await svc.ensure_page()
         self.assertNotIn("hung", str(ctx.exception))
+
+
+class ChromeLogTest(unittest.TestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2d): Chrome's own log says why a page never opened; the noise (D-Bus, fonts) stays out.
+
+    LOG = (
+        "[61:75:1019/100549.193215:ERROR:dbus/bus.cc:408] Failed to connect to the bus: Failed to connect to socket /run/dbus/system_bus_socket\n"
+        "[90:90:1019/100549.300000:INFO:CONSOLE:5] \"Agora NETWORK_ERROR: Network Error\", source: http://127.0.0.1/static/x.js\n"
+        "[61:61:1019/100549.200000:INFO:content_main_runner_impl.cc(1167)] Chrome is starting\n"
+        "[88:88:1019/100550.100000:FATAL:zygote_host_impl_linux.cc(201)] Check failed: . : Invalid argument (22)\n"
+        "[61:75:1019/100551.000000:ERROR:gpu_process_host.cc(990)] GPU process exited unexpectedly: exit_code=133\n"
+    )
+
+    def test_keeps_why_drops_noise(self):
+        from browser_service import chrome_log_lines
+
+        lines = chrome_log_lines(self.LOG)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("Check failed"))
+        self.assertIn("GPU process exited unexpectedly", lines[1])
+        self.assertFalse(any("dbus" in l.lower() for l in lines))
+
+    def test_diagnosis_carries_it_before_the_page(self):
+        from browser_service import chrome_log_lines, launch_diagnosis
+
+        d = launch_diagnosis(
+            "the browser launch hung for 120 s while opening a browser page — closed it to try again",
+            ["log: something the page said about rtm login"],
+            chrome_log_lines(self.LOG),
+        )
+        self.assertIn("· chrome log: Check failed", d)
+        self.assertLess(d.index("chrome log: "), d.index("page said: "))
+        self.assertIn("host: ", d)
+
+    def test_a_rover_link_failure_is_told_by_the_page_not_chrome_log(self):
+        from browser_service import chrome_log_lines, launch_diagnosis
+
+        d = launch_diagnosis("Page.wait_for_function: Timeout 15000ms exceeded.", ["log: AgoraRTM client login failure RtmUnauthorizedError"], chrome_log_lines(self.LOG))
+        self.assertNotIn("chrome log: ", d)
+        self.assertIn("page said: ", d)
