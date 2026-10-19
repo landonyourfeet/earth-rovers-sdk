@@ -75,6 +75,25 @@ def host_facts() -> dict:
                     out["mem_available_mb"] = round(int(line.split()[1]) / 1024)
     except Exception:
         pass
+    # ★ RV2f (Oct 19, 2026): myRover2's Chrome could not start a thread ("pthread_create: Resource temporarily unavailable") — the
+    #   container's process/thread limit and how much of it is in use
+    pm = _read_int("/sys/fs/cgroup/pids.max")
+    if pm is None:
+        pm = _read_int("/sys/fs/cgroup/pids/pids.max")
+    pc = _read_int("/sys/fs/cgroup/pids.current")
+    if pc is None:
+        pc = _read_int("/sys/fs/cgroup/pids/pids.current")
+    out["pids_max"], out["pids_current"] = pm, pc
+    try:
+        import resource
+        soft = resource.getrlimit(resource.RLIMIT_NPROC)[0]
+        out["nproc_limit"] = None if soft == resource.RLIM_INFINITY or soft < 0 else int(soft)
+    except Exception:
+        out["nproc_limit"] = None
+    try:
+        out["threads"] = sum(len(os.listdir(f"/proc/{d}/task")) for d in os.listdir("/proc") if d.isdigit() and os.path.isdir(f"/proc/{d}/task"))
+    except Exception:
+        out["threads"] = None
     return out
 
 
@@ -87,6 +106,10 @@ def host_facts_text(f: Optional[dict] = None) -> str:
         bits.append("memory %s MB free" % f["mem_available_mb"])
     if f.get("shm_mb") is not None:
         bits.append("/dev/shm %s MB (%s MB free)" % (f["shm_mb"], f.get("shm_free_mb", "?")))
+    lims = [x for x in (f.get("pids_max"), f.get("nproc_limit")) if x]
+    if f.get("threads") is not None or lims:
+        bits.append("threads %s in use%s" % (f.get("threads", "?") if f.get("threads") is not None else (f.get("pids_current") or "?"),
+                                             " (limit %s)" % min(lims) if lims else " (no limit set)"))
     return ", ".join(bits) or "no host facts readable"
 
 
@@ -213,6 +236,9 @@ class BrowserService:
         # RV2e: Chrome without its zygote — set by CHROME_NO_ZYGOTE=1, or once Chrome's own log says its zygote failed (myRover2:
         #   "Did not receive ping from zygote child"); kept for the life of this SDK process
         self.no_zygote = os.getenv("CHROME_NO_ZYGOTE", "") == "1"
+        # RV2f: a lean Chrome (no GPU process, one raster thread, few renderers) — CHROME_LEAN=1, or once Chrome's own log says a
+        #   thread or process could not be started ("pthread_create: Resource temporarily unavailable")
+        self.lean = os.getenv("CHROME_LEAN", "") == "1"
         # RV2c: the step a join is on right now, and when it began (a hung launch is cut at LAUNCH_TIMEOUT_S)
         self.launch_step: Optional[str] = None
         self.launch_started_at: Optional[float] = None
@@ -266,7 +292,7 @@ class BrowserService:
                 retry = self._zygote_check(clog)
                 self.last_error = launch_diagnosis(
                     f"the browser launch hung for {int(LAUNCH_TIMEOUT_S)} s while {step} — closed it to try again"
-                    + (" without Chrome's zygote (--no-zygote)" if retry else ""),
+                    + ((" with a lean Chrome (no GPU process, few threads)" if self.lean else " without Chrome's zygote (--no-zygote)") if retry else ""),
                     list(self._console),
                     clog,
                 )
@@ -277,6 +303,12 @@ class BrowserService:
             return self._page
 
     def _zygote_check(self, clog: list) -> bool:
+        # ★ RV2f: the container ran out of threads/processes → a lean Chrome from now on (and without the zygote, which needs them too)
+        if not self.lean and any(re.search(r"pthread_create|Resource temporarily unavailable|fork\(\) failed|Cannot allocate memory", l, re.I) for l in (clog or [])):
+            self.lean = True
+            self.no_zygote = True
+            logger.warning("The container ran out of threads for Chrome — launching a lean Chrome (--disable-gpu, few renderers, --no-zygote) from now on")
+            return True
         # ★ RV2e: Chrome's zygote failing in this container (myRover2) → every later launch goes without it. True when this changed.
         if not self.no_zygote and any(re.search(r"did not receive ping from zygote|zygote.*(fail|died|crash|NOTREACHED|Check failed)|(fail|NOTREACHED|Check failed).*zygote", l, re.I) for l in (clog or [])):
             self.no_zygote = True
@@ -336,6 +368,7 @@ class BrowserService:
                     f"--log-file={self._chrome_log_path}",
                     "--v=0",
                     *(["--no-zygote"] if self.no_zygote else []),
+                    *(["--disable-gpu", "--renderer-process-limit=2", "--num-raster-threads=1", "--disable-extensions"] if self.lean else []),
                     "--ignore-certificate-errors",
                     "--no-sandbox",
                     "--autoplay-policy=no-user-gesture-required",
@@ -422,7 +455,7 @@ class BrowserService:
         except Exception as e:
             clog = self._chrome_log_tail()
             retry = self._zygote_check(clog)
-            self.last_error = launch_diagnosis(str(e) + (" — the next try runs Chrome without its zygote (--no-zygote)" if retry else ""), list(self._console), clog)
+            self.last_error = launch_diagnosis(str(e) + ((" — the next try runs a lean Chrome (no GPU process, few threads)" if self.lean else " — the next try runs Chrome without its zygote (--no-zygote)") if retry else ""), list(self._console), clog)
             self.last_error_at = time.time()
             logger.error("Error initializing browser: %s", e)
             logger.error("Launch diagnosis: %s", self.last_error)

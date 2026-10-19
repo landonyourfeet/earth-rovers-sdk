@@ -360,6 +360,7 @@ async def get_status():
             # RV2c: what a join under way is doing right now, and for how long (a hung one is cut at LAUNCH_TIMEOUT_S)
             "browser_launch_step": browser_service.launch_step if browser_service.launching else None,
             "browser_no_zygote": browser_service.no_zygote,   # RV2e: Chrome runs without its zygote here
+            "browser_lean": browser_service.lean,   # RV2f: a lean Chrome (the container ran out of threads)
             "browser_launch_for_s": round(time.time() - browser_service.launch_started_at, 1) if browser_service.launching and browser_service.launch_started_at else None,
             "host": host_facts(),
             "mission_started": bool(auth_response_data)

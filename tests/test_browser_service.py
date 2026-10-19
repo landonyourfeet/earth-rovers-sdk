@@ -396,3 +396,36 @@ class NoZygoteTest(unittest.IsolatedAsyncioTestCase):
         from browser_service import chrome_log_lines
 
         self.assertEqual(chrome_log_lines("[1:1:1019/102040.866362:WARNING:chrome/app/chrome_main_delegate.cc:276] process type 'renderer' should be created through the zygote.\n"), [])
+
+
+class LeanChromeTest(unittest.IsolatedAsyncioTestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2f): myRover2's Chrome log said "pthread_create: Resource temporarily unavailable (11)" — the
+    #   container ran out of threads. The next launch is a lean Chrome (and without the zygote), and the reason says the limit.
+
+    async def test_out_of_threads_goes_lean(self):
+        import browser_service as bs
+
+        svc = bs.BrowserService()
+        svc.lean = False
+        svc.no_zygote = False
+
+        async def hang():
+            svc.launching = True
+            svc.launch_step = "opening a browser page"
+            await asyncio.sleep(3600)
+
+        svc._launch = hang
+        svc._chrome_log_tail = lambda: ["InitializeSandbox() called with multiple threads in process gpu-process.", "pthread_create: Resource temporarily unavailable (11)"]
+        with patch.object(bs, "LAUNCH_TIMEOUT_S", 0.2):
+            with self.assertRaises(RuntimeError) as ctx:
+                await svc.ensure_page()
+        self.assertTrue(svc.lean)
+        self.assertTrue(svc.no_zygote)
+        self.assertIn("closed it to try again with a lean Chrome (no GPU process, few threads)", str(ctx.exception))
+        self.assertIn("threads ", svc.last_error)
+
+    def test_host_text_names_the_thread_limit(self):
+        from browser_service import host_facts_text
+
+        t = host_facts_text({"mem_limit_mb": 22888, "mem_used_mb": 378, "shm_mb": 61, "shm_free_mb": 61, "threads": 498, "pids_max": 512, "nproc_limit": None})
+        self.assertIn("threads 498 in use (limit 512)", t)
