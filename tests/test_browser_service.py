@@ -1,4 +1,6 @@
+import asyncio
 import unittest
+from unittest.mock import patch
 
 from playwright.async_api import Error as PlaywrightError
 
@@ -255,3 +257,54 @@ class SdkPageErrorTest(unittest.TestCase):
         d = launch_diagnosis(m, ["error: Failed to load resource: the server responded with a status of 404 ()"])
         self.assertTrue(d.startswith(m))
         self.assertNotIn("host: ", d)
+
+
+class LaunchWatchdogTest(unittest.IsolatedAsyncioTestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2c): myRover2 read "trying to join … again now" for 42 minutes — a launch hung. A hung launch is cut,
+    #   recorded with the step it was stuck on, the browser and the driver thrown away, and the next try starts clean.
+
+    async def test_a_hung_launch_is_cut_and_says_where(self):
+        import browser_service as bs
+
+        svc = bs.BrowserService()
+
+        class _Driver:
+            stopped = False
+
+            async def stop(self):
+                _Driver.stopped = True
+
+        async def hang():
+            svc.launching = True
+            svc.launch_step = "opening a browser page"
+            svc._playwright = _Driver()
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                svc.launching = False
+
+        svc._launch = hang
+        with patch.object(bs, "LAUNCH_TIMEOUT_S", 0.2):
+            with self.assertRaises(RuntimeError) as ctx:
+                await svc.ensure_page()
+        self.assertIn("the browser launch hung for 0 s while opening a browser page", str(ctx.exception))
+        self.assertIn("host: ", svc.last_error)
+        self.assertIsNotNone(svc.last_error_at)
+        self.assertFalse(svc.launching)
+        self.assertIsNone(svc.launch_step)
+        self.assertIsNone(svc._playwright)
+        self.assertTrue(_Driver.stopped)
+
+    async def test_a_normal_failure_is_not_a_hang(self):
+        import browser_service as bs
+
+        svc = bs.BrowserService()
+
+        async def fail():
+            raise RuntimeError("the rover page /sdk answered 404: Bot unavailable for SDK")
+
+        svc._launch = fail
+        with patch.object(bs, "LAUNCH_TIMEOUT_S", 5):
+            with self.assertRaises(RuntimeError) as ctx:
+                await svc.ensure_page()
+        self.assertNotIn("hung", str(ctx.exception))

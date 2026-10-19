@@ -357,6 +357,9 @@ async def get_status():
             "browser_error_at": browser_service.last_error_at,
             # RV2b: which FrodoBots call last refused this bot's token, and its HTTP status (None once one succeeds)
             "token_error": browser_service.token_error,
+            # RV2c: what a join under way is doing right now, and for how long (a hung one is cut at LAUNCH_TIMEOUT_S)
+            "browser_launch_step": browser_service.launch_step if browser_service.launching else None,
+            "browser_launch_for_s": round(time.time() - browser_service.launch_started_at, 1) if browser_service.launching and browser_service.launch_started_at else None,
             "host": host_facts(),
             "mission_started": bool(auth_response_data)
             or not os.getenv("MISSION_SLUG"),

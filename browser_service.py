@@ -1,9 +1,11 @@
 import asyncio
 import collections
+import contextlib
 import json
 import logging
 import os
 import re
+import signal
 import time
 from typing import Optional
 
@@ -98,6 +100,35 @@ def _console_line(text: str) -> str:
     return re.sub(r"\s*color:\s*#?[0-9a-z]+;\s*font-weight:\s*\w+;?", "", line, flags=re.I).strip()[:240]
 
 
+# ★ OKCREAL (Oct 19, 2026 — RV2c): myRover2's card read "trying to join … again now" for 42 minutes — one launch hung (a page that
+#   never opened after Chrome died). No launch may hang: past this many seconds it is cut, recorded with the step it was stuck on,
+#   the browser and the Playwright driver are thrown away, and the next try starts clean.
+LAUNCH_TIMEOUT_S = float(os.getenv("BROWSER_LAUNCH_TIMEOUT_S", "120"))
+
+
+def _descendants(root: int) -> list:
+    """Every process started under root (Linux /proc) — the Playwright driver and the browsers it launched."""
+    kids = {}
+    try:
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+                kids.setdefault(ppid, []).append(int(d))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    out, todo = [], [root]
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            out.append(k)
+            todo.append(k)
+    return out
+
+
 def sdk_page_error(status: int, body: str, token_error: Optional[str]) -> str:
     """★ OKCREAL (Oct 19, 2026 — RV2b): the rover page /sdk answered an error instead of the join page (FrodoBots refused the
     bot's token), so there is no #join button and Playwright only said "Page.click: Timeout 30000ms exceeded". Say what the
@@ -152,6 +183,9 @@ class BrowserService:
         self.last_error = None
         self.last_error_at: Optional[float] = None
         self.launching = False
+        # RV2c: the step a join is on right now, and when it began (a hung launch is cut at LAUNCH_TIMEOUT_S)
+        self.launch_step: Optional[str] = None
+        self.launch_started_at: Optional[float] = None
         # RV2b: set by main.py when FrodoBots refuses the bot's token ("FrodoBots /sdk/token answered 404 for bot 'x'")
         self.token_error: Optional[str] = None
         # RV2: what the rover page printed while it was joining (Agora RTM login, channel join)
@@ -194,16 +228,48 @@ class BrowserService:
             if self.is_ready:
                 return self._page
             await self._teardown()
-            await self._launch()
+            try:
+                await asyncio.wait_for(self._launch(), timeout=LAUNCH_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                step = self.launch_step or "starting the browser"
+                self.last_error = launch_diagnosis(
+                    f"the browser launch hung for {int(LAUNCH_TIMEOUT_S)} s while {step} — closed it to try again",
+                    list(self._console),
+                )
+                self.last_error_at = time.time()
+                logger.error("Launch diagnosis: %s", self.last_error)
+                await self._hard_reset()
+                raise RuntimeError(self.last_error)
             return self._page
+
+    async def _hard_reset(self):
+        # a hung launch: close what we can (never waiting long on a dead browser), then drop the driver so the next try starts clean.
+        #   A Chrome the driver was still starting is not closed by stopping the driver, so whatever this process started is ended too.
+        kids = _descendants(os.getpid())
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(self._teardown(), timeout=10)
+        self._page = self._context = self._browser = None
+        self._ready = False
+        if self._playwright:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._playwright.stop(), timeout=15)
+            self._playwright = None
+        for pid in kids:
+            with contextlib.suppress(Exception):
+                os.kill(pid, signal.SIGKILL)
+        self.launching = False
+        self.launch_step = None
 
     async def _launch(self):
         self._ready = False
         self.launching = True
+        self.launch_started_at = time.time()
+        self.launch_step = "starting the Playwright driver"
         self._console.clear()
         try:
             if self._playwright is None:
                 self._playwright = await async_playwright().start()
+            self.launch_step = "launching Chrome"
 
             launch_kwargs = {
                 "headless": True,
@@ -249,6 +315,7 @@ class BrowserService:
                         " stream may need H.264: install Chrome or set"
                         " CHROME_EXECUTABLE_PATH to a codec-capable browser"
                     )
+            self.launch_step = "opening a browser page"
             self._context = await self._browser.new_context(
                 viewport=self._viewport,
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
@@ -261,6 +328,7 @@ class BrowserService:
                 "pageerror", lambda e: self._console.append(_console_line(f"pageerror: {e}"))
             )
             self._page.on("crash", lambda *_: self._console.append("error: page crashed"))
+            self.launch_step = "loading the rover page /sdk"
             page_resp = await self._page.goto(SDK_PAGE_URL, wait_until="domcontentloaded")
             if page_resp is not None and page_resp.status >= 400:
                 try:
@@ -268,7 +336,9 @@ class BrowserService:
                 except Exception:
                     page_body = ""
                 raise RuntimeError(sdk_page_error(page_resp.status, page_body, self.token_error))
+            self.launch_step = "pressing Join on the rover page"
             await self._page.click("#join")
+            self.launch_step = "waiting for the rover link (RTM login)"
             # Control and telemetry must remain available when a camera is
             # offline. Wait for RTM readiness, not for a video DOM element.
             await self._page.wait_for_function(
@@ -303,7 +373,7 @@ class BrowserService:
                 self._playwright = None
             raise
         finally:
-            self.launching = False
+            self.launching = False   # launch_step keeps the last step: a hung launch is reported by where it stuck
 
     async def _teardown(self):
         self._ready = False
