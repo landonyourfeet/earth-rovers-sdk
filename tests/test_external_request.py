@@ -100,3 +100,44 @@ class SdkErrorDetailTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TokenErrorTest(unittest.IsolatedAsyncioTestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2b): the SDK remembers which FrodoBots call refused the bot (status only, never the body)
+    #   so the rover browser's error and /status can say it; a later success clears it.
+
+    async def _token(self, status, body):
+        session = _FakeSession(_FakeResponse(status, body))
+        with patch.object(main.app.state, "http_session", session, create=True):
+            try:
+                return await main.retrieve_tokens({"Authorization": "Bearer x"}, "volt-radon-lima")
+            except main.HTTPException as exc:
+                return exc
+
+    async def test_refusal_is_remembered_without_the_body(self):
+        exc = await self._token(404, {"error": "secret backend words"})
+        self.assertEqual(exc.status_code, 404)
+        self.assertEqual(exc.detail, "Bot unavailable for SDK")
+        self.assertEqual(
+            main.browser_service.token_error, "FrodoBots /sdk/token answered 404 for bot 'volt-radon-lima'"
+        )
+        self.assertNotIn("secret", main.browser_service.token_error)
+
+    async def test_success_clears_it(self):
+        await self._token(404, {"error": "x"})
+        data = await self._token(200, {"CHANNEL_NAME": "c"})
+        self.assertEqual(data, {"CHANNEL_NAME": "c"})
+        self.assertIsNone(main.browser_service.token_error)
+
+    async def test_no_answer_is_remembered(self):
+        class _Down(_FakeSession):
+            def request(self, method, url, **kwargs):
+                raise main.aiohttp.ClientConnectionError("refused")
+
+        with patch.object(main.app.state, "http_session", _Down(None), create=True):
+            with self.assertRaises(main.HTTPException):
+                await main.retrieve_tokens({}, "volt")
+        self.assertEqual(
+            main.browser_service.token_error,
+            "FrodoBots /sdk/token did not answer (External API unavailable) for bot 'volt'",
+        )

@@ -221,3 +221,37 @@ class ConsoleLineTest(unittest.TestCase):
             _console_line("warning: 07:22:36:335 %cAgora-SDK [WARNING]: color: #FB8C00; font-weight: bold; [client-33994]"),
             "warning: 07:22:36:335 Agora-SDK [WARNING]: [client-33994]",
         )
+
+
+class SdkPageErrorTest(unittest.TestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2b): myRover2's card read "Page.click: Timeout 30000ms exceeded · page said: Failed to load
+    #   resource: 404" — the rover page /sdk had answered an error instead of the join page. Say what it answered and which
+    #   FrodoBots call refused the bot.
+
+    def test_json_detail_and_the_frodobots_call(self):
+        from browser_service import sdk_page_error
+
+        m = sdk_page_error(404, '{"detail":"Bot unavailable for SDK"}', "FrodoBots /sdk/token answered 404 for bot 'volt'")
+        self.assertEqual(
+            m, "the rover page /sdk answered 404: Bot unavailable for SDK — FrodoBots /sdk/token answered 404 for bot 'volt'"
+        )
+
+    def test_html_body_is_flattened_and_short(self):
+        from browser_service import sdk_page_error
+
+        m = sdk_page_error(502, "<html><body><h1>Bad   Gateway</h1>" + "x" * 900 + "</body></html>", None)
+        self.assertTrue(m.startswith("the rover page /sdk answered 502: Bad Gateway x"))
+        self.assertLessEqual(len(m), 400)
+
+    def test_empty_body(self):
+        from browser_service import sdk_page_error
+
+        self.assertEqual(sdk_page_error(500, "", None), "the rover page /sdk answered 500")
+
+    def test_diagnosis_keeps_it_first(self):
+        from browser_service import launch_diagnosis, sdk_page_error
+
+        m = sdk_page_error(404, '{"detail":"Bot unavailable for SDK"}', "FrodoBots /sdk/token answered 404 for bot 'volt'")
+        d = launch_diagnosis(m, ["error: Failed to load resource: the server responded with a status of 404 ()"])
+        self.assertTrue(d.startswith(m))
+        self.assertNotIn("host: ", d)

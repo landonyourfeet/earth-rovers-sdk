@@ -355,6 +355,8 @@ async def get_status():
             #   memory and /dev/shm (what kills headless Chrome) — so Connect can tell a stale error from a live one.
             "browser_launching": browser_service.launching,
             "browser_error_at": browser_service.last_error_at,
+            # RV2b: which FrodoBots call last refused this bot's token, and its HTTP status (None once one succeeds)
+            "token_error": browser_service.token_error,
             "host": host_facts(),
             "mission_started": bool(auth_response_data)
             or not os.getenv("MISSION_SLUG"),
@@ -457,11 +459,34 @@ def _sdk_error_detail(status, fallback):
     return fallback
 
 
+def _note_token_call(call, bot_slug, status=None, failure=None):
+    """★ OKCREAL (Oct 19, 2026 — RV2b): remember which FrodoBots call refused this bot, and how, so the rover browser's
+    error (and /status) can say it. Only the call, the HTTP status and the bot's slug — never FrodoBots' response body."""
+    if status == 200:
+        browser_service.token_error = None
+    elif failure:
+        browser_service.token_error = f"FrodoBots {call} did not answer ({failure}) for bot {bot_slug!r}"
+    else:
+        browser_service.token_error = f"FrodoBots {call} answered {status} for bot {bot_slug!r}"
+
+
+async def _token_request(call, bot_slug, **kwargs):
+    try:
+        status, response_data = await external_request(
+            "POST", FRODOBOTS_API_URL + call, **kwargs
+        )
+    except HTTPException as exc:
+        _note_token_call(call, bot_slug, failure=exc.detail)
+        raise
+    _note_token_call(call, bot_slug, status=status)
+    return status, response_data
+
+
 async def start_ride(headers, bot_slug, mission_slug):
     start_ride_data = {"bot_slug": bot_slug, "mission_slug": mission_slug}
-    status, response_data = await external_request(
-        "POST",
-        FRODOBOTS_API_URL + "/sdk/start_ride",
+    status, response_data = await _token_request(
+        "/sdk/start_ride",
+        bot_slug,
         headers=headers,
         json=start_ride_data,
     )
@@ -491,8 +516,8 @@ async def end_ride(headers, bot_slug, mission_slug):
 
 async def retrieve_tokens(headers, bot_slug):
     data = {"bot_slug": bot_slug}
-    status, response_data = await external_request(
-        "POST", FRODOBOTS_API_URL + "/sdk/token", headers=headers, json=data
+    status, response_data = await _token_request(
+        "/sdk/token", bot_slug, headers=headers, json=data
     )
     if status != 200:
         raise HTTPException(

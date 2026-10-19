@@ -1,5 +1,6 @@
 import asyncio
 import collections
+import json
 import logging
 import os
 import re
@@ -97,6 +98,26 @@ def _console_line(text: str) -> str:
     return re.sub(r"\s*color:\s*#?[0-9a-z]+;\s*font-weight:\s*\w+;?", "", line, flags=re.I).strip()[:240]
 
 
+def sdk_page_error(status: int, body: str, token_error: Optional[str]) -> str:
+    """★ OKCREAL (Oct 19, 2026 — RV2b): the rover page /sdk answered an error instead of the join page (FrodoBots refused the
+    bot's token), so there is no #join button and Playwright only said "Page.click: Timeout 30000ms exceeded". Say what the
+    page answered and which FrodoBots call failed."""
+    detail = ""
+    try:
+        parsed = json.loads(body or "")
+        if isinstance(parsed, dict) and isinstance(parsed.get("detail"), str):
+            detail = parsed["detail"]
+    except (TypeError, ValueError):
+        pass
+    if not detail:
+        detail = re.sub(r"<[^>]*>", " ", str(body or ""))
+        detail = re.sub(r"\s+", " ", detail).strip()
+    msg = f"the rover page /sdk answered {status}" + (f": {detail[:160]}" if detail else "")
+    if token_error:
+        msg += f" — {token_error}"
+    return msg[:400]
+
+
 def launch_diagnosis(err_text: str, console: list) -> str:
     lines = str(err_text or "").split("\n")
     first = lines[0].strip() or "browser launch failed"
@@ -131,6 +152,8 @@ class BrowserService:
         self.last_error = None
         self.last_error_at: Optional[float] = None
         self.launching = False
+        # RV2b: set by main.py when FrodoBots refuses the bot's token ("FrodoBots /sdk/token answered 404 for bot 'x'")
+        self.token_error: Optional[str] = None
         # RV2: what the rover page printed while it was joining (Agora RTM login, channel join)
         self._console = collections.deque(maxlen=40)
         # has_rear_camera() cache: (value, monotonic expiry). A positive
@@ -238,7 +261,13 @@ class BrowserService:
                 "pageerror", lambda e: self._console.append(_console_line(f"pageerror: {e}"))
             )
             self._page.on("crash", lambda *_: self._console.append("error: page crashed"))
-            await self._page.goto(SDK_PAGE_URL, wait_until="domcontentloaded")
+            page_resp = await self._page.goto(SDK_PAGE_URL, wait_until="domcontentloaded")
+            if page_resp is not None and page_resp.status >= 400:
+                try:
+                    page_body = await page_resp.text()
+                except Exception:
+                    page_body = ""
+                raise RuntimeError(sdk_page_error(page_resp.status, page_body, self.token_error))
             await self._page.click("#join")
             # Control and telemetry must remain available when a camera is
             # offline. Wait for RTM readiness, not for a video DOM element.
