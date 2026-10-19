@@ -153,7 +153,7 @@ def sdk_page_error(status: int, body: str, token_error: Optional[str]) -> str:
 # ★ OKCREAL (Oct 19, 2026 — RV2d): myRover2's Chrome starts but a page never opens ("hung for 120 s while opening a browser page"),
 #   and Playwright says nothing about why. Chrome writes its own log to a file (--enable-logging --log-file); after a failed or hung
 #   launch the lines that say why (FATAL, a crash, shared memory, the GPU or zygote, out of memory) join the diagnosis.
-_CHROME_LOG_NOISE = re.compile(r":CONSOLE[:(]|dbus|Failed to connect to the bus|fontconfig|gcm|google_apis|ALSA|pulse|UPower|libva|vaapi|"   # page console lines are told as "page said"
+_CHROME_LOG_NOISE = re.compile(r":CONSOLE[:(]|should be created through the zygote|dbus|Failed to connect to the bus|fontconfig|gcm|google_apis|ALSA|pulse|UPower|libva|vaapi|"   # page console lines are told as "page said"
                                r"ssl_client_socket|registration_request|voice_transcription|on_device_model|optimization_guide", re.I)
 _CHROME_LOG_WHY = re.compile(r"FATAL|Check failed|crash|shared.?memory|/dev/shm|No space|zygote|sandbox|renderer|gpu|out of memory|"
                              r"OOM|Bus error|SIGBUS|SIGSEGV|SIGKILL|ERROR", re.I)
@@ -210,6 +210,9 @@ class BrowserService:
         self.last_error = None
         self.last_error_at: Optional[float] = None
         self.launching = False
+        # RV2e: Chrome without its zygote — set by CHROME_NO_ZYGOTE=1, or once Chrome's own log says its zygote failed (myRover2:
+        #   "Did not receive ping from zygote child"); kept for the life of this SDK process
+        self.no_zygote = os.getenv("CHROME_NO_ZYGOTE", "") == "1"
         # RV2c: the step a join is on right now, and when it began (a hung launch is cut at LAUNCH_TIMEOUT_S)
         self.launch_step: Optional[str] = None
         self.launch_started_at: Optional[float] = None
@@ -259,16 +262,27 @@ class BrowserService:
                 await asyncio.wait_for(self._launch(), timeout=LAUNCH_TIMEOUT_S)
             except asyncio.TimeoutError:
                 step = self.launch_step or "starting the browser"
+                clog = self._chrome_log_tail()
+                retry = self._zygote_check(clog)
                 self.last_error = launch_diagnosis(
-                    f"the browser launch hung for {int(LAUNCH_TIMEOUT_S)} s while {step} — closed it to try again",
+                    f"the browser launch hung for {int(LAUNCH_TIMEOUT_S)} s while {step} — closed it to try again"
+                    + (" without Chrome's zygote (--no-zygote)" if retry else ""),
                     list(self._console),
-                    self._chrome_log_tail(),
+                    clog,
                 )
                 self.last_error_at = time.time()
                 logger.error("Launch diagnosis: %s", self.last_error)
                 await self._hard_reset()
                 raise RuntimeError(self.last_error)
             return self._page
+
+    def _zygote_check(self, clog: list) -> bool:
+        # ★ RV2e: Chrome's zygote failing in this container (myRover2) → every later launch goes without it. True when this changed.
+        if not self.no_zygote and any(re.search(r"did not receive ping from zygote|zygote.*(fail|died|crash|NOTREACHED|Check failed)|(fail|NOTREACHED|Check failed).*zygote", l, re.I) for l in (clog or [])):
+            self.no_zygote = True
+            logger.warning("Chrome's zygote failed here — launching without it (--no-zygote) from now on")
+            return True
+        return False
 
     def _chrome_log_tail(self) -> list:
         path = getattr(self, "_chrome_log_path", None)
@@ -321,6 +335,7 @@ class BrowserService:
                     "--enable-logging",
                     f"--log-file={self._chrome_log_path}",
                     "--v=0",
+                    *(["--no-zygote"] if self.no_zygote else []),
                     "--ignore-certificate-errors",
                     "--no-sandbox",
                     "--autoplay-policy=no-user-gesture-required",
@@ -405,7 +420,9 @@ class BrowserService:
             self.last_error = None
             logger.info("Headless browser connected to %s", SDK_PAGE_URL)
         except Exception as e:
-            self.last_error = launch_diagnosis(str(e), list(self._console), self._chrome_log_tail())
+            clog = self._chrome_log_tail()
+            retry = self._zygote_check(clog)
+            self.last_error = launch_diagnosis(str(e) + (" — the next try runs Chrome without its zygote (--no-zygote)" if retry else ""), list(self._console), clog)
             self.last_error_at = time.time()
             logger.error("Error initializing browser: %s", e)
             logger.error("Launch diagnosis: %s", self.last_error)

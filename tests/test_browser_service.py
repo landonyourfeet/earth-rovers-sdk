@@ -348,3 +348,51 @@ class ChromeLogTest(unittest.TestCase):
         d = launch_diagnosis("Page.wait_for_function: Timeout 15000ms exceeded.", ["log: AgoraRTM client login failure RtmUnauthorizedError"], chrome_log_lines(self.LOG))
         self.assertNotIn("chrome log: ", d)
         self.assertIn("page said: ", d)
+
+
+class NoZygoteTest(unittest.IsolatedAsyncioTestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2e): myRover2's Chrome log said "Did not receive ping from zygote child" — the next launch goes
+    #   without the zygote, and says so; a launch whose log does not name the zygote changes nothing.
+
+    async def test_a_zygote_failure_switches_it_off_and_says_so(self):
+        import browser_service as bs
+
+        svc = bs.BrowserService()
+        svc.no_zygote = False
+
+        async def hang():
+            svc.launching = True
+            svc.launch_step = "opening a browser page"
+            await asyncio.sleep(3600)
+
+        svc._launch = hang
+        svc._chrome_log_tail = lambda: ["NOTREACHED hit. Did not receive ping from zygote child"]
+        with patch.object(bs, "LAUNCH_TIMEOUT_S", 0.2):
+            with self.assertRaises(RuntimeError) as ctx:
+                await svc.ensure_page()
+        self.assertTrue(svc.no_zygote)
+        self.assertIn("closed it to try again without Chrome's zygote (--no-zygote)", str(ctx.exception))
+        self.assertIn("chrome log: NOTREACHED hit. Did not receive ping from zygote child", svc.last_error)
+
+    async def test_other_failures_leave_it_on(self):
+        import browser_service as bs
+
+        svc = bs.BrowserService()
+        svc.no_zygote = False
+
+        async def hang():
+            svc.launching = True
+            svc.launch_step = "opening a browser page"
+            await asyncio.sleep(3600)
+
+        svc._launch = hang
+        svc._chrome_log_tail = lambda: ["GPU process exited unexpectedly: exit_code=133"]
+        with patch.object(bs, "LAUNCH_TIMEOUT_S", 0.2):
+            with self.assertRaises(RuntimeError):
+                await svc.ensure_page()
+        self.assertFalse(svc.no_zygote)
+
+    def test_no_zygote_warnings_are_noise(self):
+        from browser_service import chrome_log_lines
+
+        self.assertEqual(chrome_log_lines("[1:1:1019/102040.866362:WARNING:chrome/app/chrome_main_delegate.cc:276] process type 'renderer' should be created through the zygote.\n"), [])
