@@ -1,6 +1,8 @@
 import asyncio
+import collections
 import logging
 import os
+import re
 import time
 from typing import Optional
 
@@ -32,6 +34,91 @@ if FEED_QUALITY < 0 or FEED_QUALITY > 1:
 SDK_PAGE_URL = os.getenv("SDK_PAGE_URL", "http://127.0.0.1:8000/sdk")
 
 
+# ★ OKCREAL (Oct 19, 2026 — RV2, Landon: "myrover 2 is live and connected to frodo bots but not being see in connect").
+#   Connect could only say "could not join Volt Radon Lima — BrowserContext.new_page: Target page, context or browser has been
+#   closed": the first line of Playwright's error. Why Chrome died, and what the rover page said while it tried to join, were
+#   thrown away. These read the container's own limits (memory, /dev/shm — the two things that kill headless Chrome) and keep
+#   the lines that explain a failed join, so /status and Connect can say the real cause.
+def _read_int(path):
+    try:
+        with open(path) as f:
+            v = f.read().strip()
+        return None if v in ("", "max") else int(v)
+    except Exception:
+        return None
+
+
+def host_facts() -> dict:
+    out = {"cpus": os.cpu_count()}
+    try:
+        st = os.statvfs("/dev/shm")
+        out["shm_mb"] = round(st.f_blocks * st.f_frsize / 1048576)
+        out["shm_free_mb"] = round(st.f_bavail * st.f_frsize / 1048576)
+    except Exception:
+        out["shm_mb"] = None
+    limit = _read_int("/sys/fs/cgroup/memory.max")
+    if limit is None:
+        limit = _read_int("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    out["mem_limit_mb"] = round(limit / 1048576) if limit and limit < (1 << 50) else None
+    used = _read_int("/sys/fs/cgroup/memory.current")
+    if used is None:
+        used = _read_int("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    out["mem_used_mb"] = round(used / 1048576) if used else None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    out["mem_available_mb"] = round(int(line.split()[1]) / 1024)
+    except Exception:
+        pass
+    return out
+
+
+def host_facts_text(f: Optional[dict] = None) -> str:
+    f = f or host_facts()
+    bits = []
+    if f.get("mem_limit_mb"):
+        bits.append("memory %s MB limit, %s MB used" % (f["mem_limit_mb"], f.get("mem_used_mb", "?")))
+    elif f.get("mem_available_mb") is not None:
+        bits.append("memory %s MB free" % f["mem_available_mb"])
+    if f.get("shm_mb") is not None:
+        bits.append("/dev/shm %s MB (%s MB free)" % (f["shm_mb"], f.get("shm_free_mb", "?")))
+    return ", ".join(bits) or "no host facts readable"
+
+
+_CHROME_WHY = re.compile(r"error|fatal|shm|memory|killed|crash|denied|no space|sandbox|signal", re.I)
+_PAGE_WHY = re.compile(r"fail|error|abort|denied|token|login|connectionstate|refused|expired|unauthor|invalid|offline", re.I)
+_PAGE_STRONG = re.compile(r"rtm|login|token|abort|unauthor|expired|channel|join", re.I)
+
+
+def _console_line(text: str) -> str:
+    # one line per message, without the stack trace or the console's %c styling
+    line = str(text or "").split("\n", 1)[0].replace("%c", "")
+    return re.sub(r"\s*color:\s*#?[0-9a-z]+;\s*font-weight:\s*\w+;?", "", line, flags=re.I).strip()[:240]
+
+
+def launch_diagnosis(err_text: str, console: list) -> str:
+    lines = str(err_text or "").split("\n")
+    first = lines[0].strip() or "browser launch failed"
+    parts = [first]
+    chrome = [l.strip() for l in lines[1:] if l.strip() and _CHROME_WHY.search(l)]
+    if chrome:
+        parts.append("chrome: " + " | ".join(chrome[-2:])[:200])
+    said = []
+    for c in console:
+        if _PAGE_WHY.search(c) and c not in said:
+            said.append(c)
+    # the rover link's own words (Agora RTM login, token, channel) outrank a stray resource that would not load
+    strong = [c for c in said if _PAGE_STRONG.search(c)]
+    weak = [c for c in said if c not in strong]
+    pick = (strong[-2:] + weak[-1:]) if strong else weak[-3:]
+    if pick:
+        parts.append("page said: " + " | ".join(pick)[:260])
+    if re.search(r"closed|crash|target", first, re.I) or chrome:
+        parts.append("host: " + host_facts_text())
+    return " · ".join(parts)[:600]
+
+
 class BrowserService:
     def __init__(self):
         self._playwright = None
@@ -42,6 +129,10 @@ class BrowserService:
         self._lock = None
         self._lock_loop = None
         self.last_error = None
+        self.last_error_at: Optional[float] = None
+        self.launching = False
+        # RV2: what the rover page printed while it was joining (Agora RTM login, channel join)
+        self._console = collections.deque(maxlen=40)
         # has_rear_camera() cache: (value, monotonic expiry). A positive
         # result holds for the page's lifetime; a negative one only briefly,
         # since the rear track can subscribe late after the Agora join.
@@ -85,6 +176,8 @@ class BrowserService:
 
     async def _launch(self):
         self._ready = False
+        self.launching = True
+        self._console.clear()
         try:
             if self._playwright is None:
                 self._playwright = await async_playwright().start()
@@ -138,6 +231,13 @@ class BrowserService:
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             self._page = await self._context.new_page()
+            self._page.on(
+                "console", lambda m: self._console.append(_console_line(f"{m.type}: {m.text}"))
+            )
+            self._page.on(
+                "pageerror", lambda e: self._console.append(_console_line(f"pageerror: {e}"))
+            )
+            self._page.on("crash", lambda *_: self._console.append("error: page crashed"))
             await self._page.goto(SDK_PAGE_URL, wait_until="domcontentloaded")
             await self._page.click("#join")
             # Control and telemetry must remain available when a camera is
@@ -159,8 +259,10 @@ class BrowserService:
             self.last_error = None
             logger.info("Headless browser connected to %s", SDK_PAGE_URL)
         except Exception as e:
-            self.last_error = str(e).split("\n", 1)[0]
+            self.last_error = launch_diagnosis(str(e), list(self._console))
+            self.last_error_at = time.time()
             logger.error("Error initializing browser: %s", e)
+            logger.error("Launch diagnosis: %s", self.last_error)
             await self._teardown()
             # A failed Playwright transport cannot recover by reusing the same
             # driver instance. Recreate it on the next warm-up attempt.
@@ -171,6 +273,8 @@ class BrowserService:
                     pass
                 self._playwright = None
             raise
+        finally:
+            self.launching = False
 
     async def _teardown(self):
         self._ready = False

@@ -137,3 +137,87 @@ class LockLoopBindingTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LaunchDiagnosisTest(unittest.TestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2): Connect showed only the first line of Playwright's error. The diagnosis keeps the lines
+    #   that explain a failed join and, when Chrome itself died, the container's memory and /dev/shm.
+
+    def test_chrome_death_reports_host_limits_and_chrome_lines(self):
+        from browser_service import launch_diagnosis
+
+        err = (
+            "BrowserContext.new_page: Target page, context or browser has been closed\n"
+            "Browser logs:\n\n<launching> /opt/google/chrome/chrome --headless\n"
+            "[pid=41][err] [41:41:FATAL:shared_memory_switch.cc(237)] Creating shared memory in /dev/shm failed: No space left on device\n"
+            "[pid=41] <process did exit: exitCode=null, signal=SIGTRAP>"
+        )
+        d = launch_diagnosis(err, [])
+        self.assertTrue(d.startswith("BrowserContext.new_page: Target page, context or browser has been closed"))
+        self.assertIn("chrome: ", d)
+        self.assertIn("Creating shared memory in /dev/shm failed", d)
+        self.assertIn("host: ", d)
+        self.assertLessEqual(len(d), 600)
+
+    def test_failed_join_keeps_what_the_page_said(self):
+        from browser_service import launch_diagnosis
+
+        console = [
+            "log: on connection state changed to CONNECTING reason: LOGIN",
+            "log: AgoraRTM client login failure RtmUnauthorizedError: token expired",
+            "log: on connection state changed to ABORTED reason: LOGIN_FAILURE",
+            "log: harmless line",
+        ]
+        d = launch_diagnosis("Page.wait_for_function: Timeout 15000ms exceeded.\nCall log:\n  - waiting", console)
+        self.assertTrue(d.startswith("Page.wait_for_function: Timeout 15000ms exceeded."))
+        self.assertIn("page said: ", d)
+        self.assertIn("RtmUnauthorizedError: token expired", d)
+        self.assertNotIn("harmless line", d)
+        self.assertNotIn("host: ", d)   # Chrome did not die; its limits are not the story
+
+    def test_host_facts_text_reads_the_container(self):
+        from browser_service import host_facts, host_facts_text
+
+        f = host_facts()
+        self.assertIn("cpus", f)
+        self.assertTrue(host_facts_text(f))
+
+
+class LaunchingFlagTest(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_launch_clears_launching_and_records_diagnosis(self):
+        import browser_service as bs
+
+        class Boom:
+            async def start(self):
+                raise PlaywrightError("BrowserType.launch: Target page, context or browser has been closed")
+
+        service = BrowserService()
+        seen = []
+        orig = bs.async_playwright
+        bs.async_playwright = lambda: Boom()
+        try:
+            async def watch():
+                seen.append(service.launching)
+            with self.assertRaises(PlaywrightError):
+                task = service._launch()
+                await watch()
+                await task
+        finally:
+            bs.async_playwright = orig
+        self.assertFalse(service.launching)
+        self.assertIsNotNone(service.last_error_at)
+        self.assertIn("host: ", service.last_error)
+
+
+class ConsoleLineTest(unittest.TestCase):
+    def test_one_line_without_styling(self):
+        from browser_service import _console_line
+
+        self.assertEqual(
+            _console_line('log: AgoraRTM client login failure RtmTimeoutError:  Error Code 9 - timed out after 12s.\n    at t.<anonymous> (http://x/static/a.js)'),
+            "log: AgoraRTM client login failure RtmTimeoutError:  Error Code 9 - timed out after 12s.",
+        )
+        self.assertEqual(
+            _console_line("warning: 07:22:36:335 %cAgora-SDK [WARNING]: color: #FB8C00; font-weight: bold; [client-33994]"),
+            "warning: 07:22:36:335 Agora-SDK [WARNING]: [client-33994]",
+        )

@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Literal, Optional
 
-from browser_service import FEED_QUALITY, FORMAT, QUALITY, BrowserService
+from browser_service import FEED_QUALITY, FORMAT, QUALITY, BrowserService, host_facts
 from rtm_client import RtmClient
 from telemetry_hub import TelemetryHub
 from tts_service import generate_speech
@@ -351,6 +351,11 @@ async def get_status():
         content={
             "browser_ready": browser_service.is_ready,
             "browser_error": browser_service.last_error,
+            # ★ OKCREAL (Oct 19, 2026 — RV2): is a join under way right now, when did the last one fail, and the container's
+            #   memory and /dev/shm (what kills headless Chrome) — so Connect can tell a stale error from a live one.
+            "browser_launching": browser_service.launching,
+            "browser_error_at": browser_service.last_error_at,
+            "host": host_facts(),
             "mission_started": bool(auth_response_data)
             or not os.getenv("MISSION_SLUG"),
             "rtm": await browser_service.rtm_health(),
