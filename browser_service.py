@@ -94,6 +94,7 @@ def host_facts() -> dict:
         out["threads"] = sum(len(os.listdir(f"/proc/{d}/task")) for d in os.listdir("/proc") if d.isdigit() and os.path.isdir(f"/proc/{d}/task"))
     except Exception:
         out["threads"] = None
+    out["zombies"] = zombie_count()   # RV2g: finished processes nobody reaped — each still holds a PID/thread slot
     return out
 
 
@@ -110,6 +111,8 @@ def host_facts_text(f: Optional[dict] = None) -> str:
     if f.get("threads") is not None or lims:
         bits.append("threads %s in use%s" % (f.get("threads", "?") if f.get("threads") is not None else (f.get("pids_current") or "?"),
                                              " (limit %s)" % min(lims) if lims else " (no limit set)"))
+    if f.get("zombies"):
+        bits.append("%s unreaped (zombie) processes" % f["zombies"])
     return ", ".join(bits) or "no host facts readable"
 
 
@@ -128,6 +131,69 @@ def _console_line(text: str) -> str:
 #   never opened after Chrome died). No launch may hang: past this many seconds it is cut, recorded with the step it was stuck on,
 #   the browser and the Playwright driver are thrown away, and the next try starts clean.
 LAUNCH_TIMEOUT_S = float(os.getenv("BROWSER_LAUNCH_TIMEOUT_S", "120"))
+
+
+# ★ OKCREAL (Oct 19, 2026 — RV2g): myRover2's container sat at "threads 938 in use (limit 1000)". The SDK runs as PID 1 there
+#   (Dockerfile CMD), so every Chrome process orphaned by a closed browser is re-parented to it — and Python never reaps children it did
+#   not start, so each one stays a zombie holding a PID/thread slot until the container can start no thread at all
+#   ("pthread_create: Resource temporarily unavailable", "Did not receive ping from zygote child"). Rover 2 retries a failing join every
+#   few seconds, so it filled first. The SDK now makes itself the subreaper of what it starts (when it is not PID 1) and reaps finished
+#   orphaned Chrome processes.
+def become_subreaper() -> bool:
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0   # PR_SET_CHILD_SUBREAPER
+    except Exception:
+        return False
+
+
+def _proc_stat(d: str):
+    with open(f"/proc/{d}/stat") as f:
+        st = f.read()
+    comm = st[st.index("(") + 1:st.rindex(")")]
+    rest = st[st.rindex(")") + 2:].split()
+    return comm, rest[0], int(rest[1])
+
+
+def reap_orphans() -> int:
+    """Reap finished Chrome processes that were re-parented to this process (zombies). Only browser processes — never the
+    Playwright driver or anything asyncio is waiting on."""
+    me, n = os.getpid(), 0
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return 0
+    for d in entries:
+        if not d.isdigit():
+            continue
+        try:
+            comm, state, ppid = _proc_stat(d)
+        except Exception:
+            continue
+        if state == "Z" and ppid == me and re.search(r"chrom|crashpad|headless", comm, re.I):
+            try:
+                if os.waitpid(int(d), os.WNOHANG)[0]:
+                    n += 1
+            except ChildProcessError:
+                pass
+            except Exception:
+                pass
+    return n
+
+
+def zombie_count() -> int:
+    n = 0
+    try:
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    if _proc_stat(d)[1] == "Z":
+                        n += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return n
 
 
 def _descendants(root: int) -> list:
@@ -239,6 +305,7 @@ class BrowserService:
         # RV2f: a lean Chrome (no GPU process, one raster thread, few renderers) — CHROME_LEAN=1, or once Chrome's own log says a
         #   thread or process could not be started ("pthread_create: Resource temporarily unavailable")
         self.lean = os.getenv("CHROME_LEAN", "") == "1"
+        self.reaped_total = 0   # RV2g: orphaned Chrome processes reaped
         # RV2c: the step a join is on right now, and when it began (a hung launch is cut at LAUNCH_TIMEOUT_S)
         self.launch_step: Optional[str] = None
         self.launch_started_at: Optional[float] = None
@@ -471,6 +538,11 @@ class BrowserService:
             raise
         finally:
             self.launching = False   # launch_step keeps the last step: a hung launch is reported by where it stuck
+
+    def reap(self) -> int:
+        n = reap_orphans()
+        self.reaped_total += n
+        return n
 
     async def _teardown(self):
         self._ready = False

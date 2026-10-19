@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Literal, Optional
 
-from browser_service import FEED_QUALITY, FORMAT, QUALITY, BrowserService, host_facts
+from browser_service import FEED_QUALITY, FORMAT, QUALITY, BrowserService, become_subreaper, host_facts
 from rtm_client import RtmClient
 from telemetry_hub import TelemetryHub
 from tts_service import generate_speech
@@ -40,6 +40,21 @@ async def warmup_browser_when_ready():
     await browser_service.warmup()
 
 
+# ★ OKCREAL (Oct 19, 2026 — RV2g): finished Chrome processes re-parented to this process are reaped every few seconds — the SDK
+#   is PID 1 in its container and nothing else reaps them (myRover2 reached 938 of its 1,000 threads and Chrome could not start).
+SUBREAPER = become_subreaper()
+REAP_EVERY_S = float(os.getenv("SDK_REAP_EVERY_S", "10"))
+
+
+async def _reaper():
+    while True:
+        try:
+            browser_service.reap()
+        except Exception as exc:
+            logger.warning("Reaper: %s", exc)
+        await asyncio.sleep(REAP_EVERY_S)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Background task: the page loads /sdk from this same server, which only
@@ -49,10 +64,14 @@ async def lifespan(app: FastAPI):
     )
     warmup_task = asyncio.create_task(warmup_browser_when_ready())
     odo_task = asyncio.create_task(_odo_ticker())   # ★ OKCREAL: dead-reckoning integrator for RETURN TO DOCK
+    reap_task = asyncio.create_task(_reaper())   # ★ OKCREAL (RV2g): reap orphaned Chrome processes
     yield
     odo_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await odo_task
+    reap_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await reap_task
     warmup_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await warmup_task
@@ -361,6 +380,8 @@ async def get_status():
             "browser_launch_step": browser_service.launch_step if browser_service.launching else None,
             "browser_no_zygote": browser_service.no_zygote,   # RV2e: Chrome runs without its zygote here
             "browser_lean": browser_service.lean,   # RV2f: a lean Chrome (the container ran out of threads)
+            "reaped_total": browser_service.reaped_total,   # RV2g: orphaned Chrome processes reaped since start
+            "subreaper": SUBREAPER or os.getpid() == 1,
             "browser_launch_for_s": round(time.time() - browser_service.launch_started_at, 1) if browser_service.launching and browser_service.launch_started_at else None,
             "host": host_facts(),
             "mission_started": bool(auth_response_data)

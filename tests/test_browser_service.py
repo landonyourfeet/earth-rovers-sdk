@@ -429,3 +429,48 @@ class LeanChromeTest(unittest.IsolatedAsyncioTestCase):
 
         t = host_facts_text({"mem_limit_mb": 22888, "mem_used_mb": 378, "shm_mb": 61, "shm_free_mb": 61, "threads": 498, "pids_max": 512, "nproc_limit": None})
         self.assertIn("threads 498 in use (limit 512)", t)
+
+
+class ReapTest(unittest.TestCase):
+    # ★ OKCREAL (Oct 19, 2026 — RV2g): a finished Chrome process re-parented to the SDK is reaped (a zombie holds a PID/thread slot);
+    #   other finished children (the Playwright driver, anything asyncio waits on) are left alone.
+
+    def _child(self, name):
+        import os, shutil, subprocess, tempfile
+        d = tempfile.mkdtemp()
+        exe = os.path.join(d, name)
+        shutil.copy("/bin/sleep", exe)
+        return subprocess.Popen([exe, "0.05"])
+
+    def _state(self, pid):
+        from browser_service import _proc_stat
+        try:
+            return _proc_stat(str(pid))[1]
+        except Exception:
+            return None
+
+    def test_a_finished_chrome_is_reaped_and_counted(self):
+        import time
+        from browser_service import BrowserService, host_facts, zombie_count
+        p = self._child("chrome")
+        time.sleep(0.4)
+        self.assertEqual(self._state(p.pid), "Z")
+        self.assertGreaterEqual(zombie_count(), 1)
+        self.assertIn("zombies", host_facts())
+        svc = BrowserService()
+        self.assertGreaterEqual(svc.reap(), 1)
+        self.assertIsNone(self._state(p.pid))
+        self.assertGreaterEqual(svc.reaped_total, 1)
+
+    def test_other_children_are_left_alone(self):
+        import time
+        from browser_service import reap_orphans
+        p = self._child("node")
+        time.sleep(0.4)
+        reap_orphans()
+        self.assertEqual(self._state(p.pid), "Z")
+        p.wait()
+
+    def test_host_text_names_zombies(self):
+        from browser_service import host_facts_text
+        self.assertIn("930 unreaped (zombie) processes", host_facts_text({"threads": 938, "pids_max": 1000, "zombies": 930}))
